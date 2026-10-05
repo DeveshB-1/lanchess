@@ -1,0 +1,83 @@
+# Reusable workflow: build the .deb and the Arch package and test them in
+# containers. Called by ci.yml (every push / pull request) and release.yml (tags).
+name: Packages
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: .deb (Ubuntu runner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - name: Build lanchess_V-1_all.deb
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          python packaging/build_packages.py --only deb --strict
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  arch:
+    name: Arch package (Arch container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: docker.io/library/archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel python git
+      - uses: actions/checkout@v7
+      - name: Build lanchess-V-1-any.pkg.tar.zst (makepkg refuses root, so build a copy as a regular user)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          epoch="$(git log -1 --format=%ct)"
+          useradd --create-home builder
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder: /home/builder/src
+          su builder -c "cd ~/src && SOURCE_DATE_EPOCH=$epoch python3 packaging/build_packages.py --only arch --strict"
+          mkdir -p dist
+          cp /home/builder/src/dist/*.pkg.tar.zst dist/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  smoke:
+    name: Install and test in containers
+    needs: [deb, arch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        run: python3 packaging/build_packages.py --sums-only
+      - name: Container matrix (Ubuntu 20.04-26.04, Arch, makepkg, AUR recipe, install.sh, lintian, namcap)
+        run: CONTAINER_ENGINE=docker JOBS=4 CASE_TIMEOUT=1200 LOG_DIR="$RUNNER_TEMP/test-logs" packaging/test_in_containers.sh
+      - name: Upload the container logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: container-test-logs
+          path: ${{ runner.temp }}/test-logs/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

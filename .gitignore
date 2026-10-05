@@ -1,0 +1,29 @@
+# Python caches and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.pyz
+.venv/
+venv/
+.tox/
+.pytest_cache/
+.mypy_cache/
+
+# Package build trees and outputs (makepkg in packaging/aur writes src/, pkg/,
+# the source tarball, the package and, with -L, logs next to the PKGBUILD)
+packaging/aur/src/
+packaging/aur/pkg/
+packaging/aur/*.tar.*
+packaging/aur/*.log
+*.pkg.tar.zst
+*.deb
+
+# Games saved while testing from the source tree
+lanchess_games/
+
+# Local tool state
+.omc/
+.ruff_cache/

@@ -1,0 +1,4 @@
+[lanchess]
+title=LAN Chess
+description=Terminal chess for two players on the same network (game TCP 5555, network search UDP 5556)
+ports=5555/tcp|5556/udp

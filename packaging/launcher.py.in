@@ -1,0 +1,17 @@
+#!@PYTHON@
+"""Start LAN Chess from the private package directory installed by `make install`."""
+
+import sys
+
+if sys.version_info < (3, 8):
+    sys.exit("LAN Chess needs Python 3.8 or newer.")
+
+# The package lives outside site-packages so it works with every Python 3
+# version. Never write bytecode there: the directory belongs to the package
+# manager, and stray __pycache__ files would survive an uninstall.
+sys.dont_write_bytecode = True
+sys.path.insert(0, "@PKGDATADIR@")
+
+from lanchess.cli import main  # noqa: E402
+
+sys.exit(main())

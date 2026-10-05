@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]   # tags run release.yml instead
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.8, the oldest supported version, on Linux and Windows.
+          # actions/python-versions has 3.8 builds for Ubuntu 24.04 (3.8.18)
+          # and Windows (3.8.10) but none for Ubuntu 26.04, so the Linux job
+          # names ubuntu-24.04 instead of following ubuntu-latest.
+          - { os: ubuntu-24.04, python: "3.8" }
+          - { os: windows-latest, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.x" }
+          - { os: macos-latest, python: "3.x" }
+          - { os: windows-latest, python: "3.x" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  packages:
+    name: Packages
+    needs: test
+    uses: ./.github/workflows/packages.yml

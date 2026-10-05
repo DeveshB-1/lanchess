@@ -1,0 +1,86 @@
+# Packaging metadata for pip / pipx (wheel and sdist).
+#
+# The backend is hatchling. Python 3.8 and 3.9 resolve hatchling 1.27 (the
+# last release that runs on them) and newer Pythons resolve the latest
+# release; both accept the SPDX `license = "MIT"` string and `license-files`
+# (PEP 639), so the same file builds cleanly everywhere. setuptools is not
+# used because its licence-metadata syntax changed incompatibly between
+# 75.3 (last release for Python 3.8) and 77+.
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lanchess"
+dynamic = ["version"]
+description = "Terminal chess for two players on two computers on the same LAN"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Devesh B", email = "devesh.b@esds.co.in" }]
+maintainers = [{ name = "Devesh B", email = "devesh.b@esds.co.in" }]
+keywords = ["chess", "terminal", "lan", "multiplayer", "network", "game", "pgn", "tui"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Games/Entertainment :: Board Games",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DeveshB-1/lanchess"
+Source = "https://github.com/DeveshB-1/lanchess"
+Issues = "https://github.com/DeveshB-1/lanchess/issues"
+Releases = "https://github.com/DeveshB-1/lanchess/releases"
+
+[project.scripts]
+lanchess = "lanchess.cli:main"
+
+[tool.hatch.version]
+path = "lanchess/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lanchess"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/lanchess",
+    "/tests",
+    "/packaging",
+    "/.github",
+    "/Makefile",
+    "/LICENSE",
+    "/README.md",
+    "/docs",
+    "/build.py",
+    "/play.py",
+    "/install.sh",
+    "/pyproject.toml",
+    "/.gitignore",
+]
+# makepkg output in packaging/aur (also in .gitignore, which hatchling reads)
+exclude = [
+    "__pycache__",
+    "*.py[cod]",
+    "/packaging/aur/src",
+    "/packaging/aur/pkg",
+    "/packaging/aur/*.tar.*",
+    "/packaging/aur/*.log",
+    "*.pkg.tar.*",
+]

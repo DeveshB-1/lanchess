@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=LAN Chess
+GenericName=Chess Game
+Comment=Play chess in a terminal against a friend on the same network
+Icon=lanchess
+Exec=lanchess
+Terminal=true
+Categories=Game;BoardGame;
+Keywords=chess;board;game;network;LAN;multiplayer;terminal;hot-seat;
+Actions=Host;Join;Local;
+
+[Desktop Action Host]
+Name=Host a Network Game
+Exec=lanchess host
+
+[Desktop Action Join]
+Name=Join a Network Game
+Exec=lanchess join
+
+[Desktop Action Local]
+Name=Hot-Seat Game on This Computer
+Exec=lanchess local

@@ -1,0 +1,336 @@
+.\" Manual page for LAN Chess (lanchess).
+.\" Copyright (c) 2026 Devesh B. MIT License, see the LICENSE file.
+.TH LANCHESS 6 "2026-10-01" "lanchess 1.0.0" "Games"
+.SH NAME
+lanchess \- terminal chess for two players on the same network
+.SH SYNOPSIS
+.SY lanchess
+.B host
+.OP \-\-port N
+.OP \-\-name NAME
+.OP \-\-color white|black|random
+.OP \-\-time TC
+.OP \-\-fen FEN
+.OP \-\-no\-discovery
+.RI [ common-options ]
+.YS
+.SY lanchess
+.B join
+.RI [ HOST [: PORT ]]
+.OP \-\-port N
+.OP \-\-name NAME
+.OP \-\-scan\-time S
+.RI [ common-options ]
+.YS
+.SY lanchess
+.B local
+.OP \-\-time TC
+.OP \-\-fen FEN
+.OP \-\-no\-flip
+.RI [ common-options ]
+.YS
+.SY lanchess
+.B \-\-version
+.YS
+.PP
+.I common-options
+are
+.OP \-\-ascii
+.OP \-\-no\-color
+.OP \-\-plain
+.OP \-\-pgn\-dir DIR
+.OP \-\-no\-save
+.SH DESCRIPTION
+.B lanchess
+plays chess inside a terminal.
+Two people on two computers on the same Wi\-Fi or wired network play
+against each other: one computer
+.BR host s
+the game, the other
+.BR join s
+it.
+There is also a hot\-seat mode,
+.BR local ,
+for two players sharing one keyboard.
+.PP
+The screen shows a live board, chess clocks, captured pieces, the move list,
+a message log with chat, and an input line.
+Draw offers, takebacks and rematches are supported, and every finished game
+is saved as a PGN file.
+.PP
+.B lanchess
+uses only the Python standard library and needs Python 3.8 or newer.
+Both players must run the same protocol version.
+.SH MODES
+.TP
+.B host
+Listen for an opponent on TCP port 5555 (or
+.BR \-\-port ).
+The host prints its IP addresses together with the exact
+.B join
+command to type on the other computer, answers network searches on
+UDP port 5556, and waits until an opponent connects.
+Press Ctrl\-C to stop waiting.
+The host's colour, time control and start position apply to both players.
+.TP
+.BR join " [\fIHOST\fR[:\fIPORT\fR]]"
+Connect to a host.
+.I HOST
+is an IP address such as
+.B 192.168.1.23
+or a host name, optionally followed by a colon and a port number
+.RB ( 192.168.1.23:6000 ).
+Without
+.IR HOST ,
+the network is searched for a few seconds and the games found are listed;
+type the number of a game or an address.
+.TP
+.B local
+Hot\-seat game on one computer.
+Whoever is to move types the move, and the board turns to face the side to
+move.
+.B /draw
+ends the game as a draw at once,
+.B /resign
+resigns for the side to move and
+.B /takeback
+undoes one move at once.
+.SH OPTIONS
+.TP
+.BI \-\-port " N"
+.BR host :
+TCP port to listen on.
+.BR join :
+port to connect to when
+.I HOST
+has no
+.BI : PORT
+part.
+Default: 5555.
+.TP
+.BI \-\-name " NAME"
+The name your opponent sees, trimmed to 20 characters.
+Default: your login name, or
+.BR Player .
+.TP
+.BR \-\-color " white|black|random"
+.BR host :
+the host's own colour; the joiner gets the other one.
+Default: white.
+.TP
+.BI \-\-time " TC"
+.BR host ", " local :
+time control
+.IB MINUTES + INCREMENT ,
+for example
+.B 5+3
+(5 minutes each plus 3 seconds per move),
+.B 10
+(10 minutes, no increment) or
+.B 0.5+0
+(30 seconds).
+.B none
+or
+.B 0
+means untimed, which is the default.
+No clock runs until White makes the first move.
+.TP
+.BI \-\-fen " FEN"
+.BR host ", " local :
+start from a custom position given in Forsyth\-Edwards Notation.
+.TP
+.B \-\-no\-discovery
+.BR host :
+do not answer network searches; the joiner must type the host's address.
+.TP
+.BI \-\-scan\-time " S"
+.BR join :
+how many seconds to search the network for hosts.
+Default: 2.5.
+.TP
+.B \-\-no\-flip
+.BR local :
+keep the board facing one way instead of turning it to the side to move.
+.TP
+.B \-\-ascii
+Draw pieces as letters (K Q R B N P) instead of chess symbols.
+.TP
+.B \-\-no\-color
+Turn off colours and all terminal escape sequences.
+.TP
+.B \-\-plain
+Line\-by\-line output instead of the full\-screen view, for basic terminals,
+screen readers, logging or scripted input.
+The board is printed after every change.
+.TP
+.BI \-\-pgn\-dir " DIR"
+Directory for saved games.
+Default:
+.IR ~/lanchess_games/ .
+.TP
+.B \-\-no\-save
+Do not save finished games automatically.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH ENTERING MOVES
+Type a move and press Enter.
+Standard algebraic notation
+.RB ( e4 ", " Nf3 ", " exd5 ", " O\-O ", " e8=Q )
+and coordinates
+.RB ( e2e4 ", " e2\-e4 ", " g1f3 ", " e7e8q )
+are both accepted, and capital letters are optional.
+Castling may also be typed as
+.BR 0\-0 ,
+.B o\-o
+or as the king moving two squares
+.RB ( e1g1 ).
+A pawn reaching the last rank becomes a queen unless another piece is named.
+Anything that does not start with
+.B /
+is read as a move.
+.SH IN-GAME COMMANDS
+.TP
+.BR /help ", " ?
+Show the command reference.
+.TP
+.BR /c ", " /chat ", " /say " \fImessage\fR"
+Send a chat message (up to 500 characters).
+.TP
+.B /resign
+Resign the game.
+.TP
+.B /draw
+Offer a draw, or accept the opponent's offer.
+.TP
+.BR /accept ", " /decline
+Answer the opponent's pending draw, takeback or rematch offer.
+.TP
+.BR /takeback ", " /undo
+Ask to take back your last move.
+.TP
+.B /flip
+Turn the board around.
+.TP
+.B /moves
+List the legal moves.
+.TP
+.B /fen
+Show the current position as FEN.
+.TP
+.B /pgn
+Show the game so far as PGN.
+.TP
+.BR /save " [\fIpath\fR]"
+Save the game as PGN now, to
+.I path
+or to the default directory.
+.TP
+.B /rematch
+After the game ends, offer a rematch with colours swapped.
+.TP
+.BR /quit ", " /exit ", " /q
+Leave the program.
+During a network game in progress the first
+.B /quit
+asks for confirmation; a second one within 10 seconds resigns and leaves.
+.TP
+.B /clear
+Clear the message log.
+.SH KEYS
+In the full\-screen view: Up and Down recall earlier input;
+Left, Right, Home, End, Ctrl\-A and Ctrl\-E move the cursor;
+Ctrl\-U clears the input line; Ctrl\-W deletes the previous word;
+PgUp and PgDn scroll the message log; Ctrl\-L redraws the screen.
+.SH FILES
+.TP
+.I ~/lanchess_games/
+Finished games are saved here as
+.IR YYYYMMDD-HHMMSS _ White -vs- Black .pgn
+unless
+.B \-\-no\-save
+or
+.B \-\-pgn\-dir
+is given.
+.TP
+.I /usr/share/lanchess/
+The Python package used by the
+.B lanchess
+command (under
+.I /usr/local/share/lanchess/
+for a
+.B make install
+with the default prefix).
+.TP
+.I /usr/lib/firewalld/services/lanchess.xml
+firewalld service definition opening TCP 5555 and UDP 5556
+.RI ( /etc/firewalld/services/lanchess.xml
+after a
+.B make install
+with a prefix other than
+.IR /usr ).
+.TP
+.I /etc/ufw/applications.d/lanchess
+ufw application profile opening TCP 5555 and UDP 5556.
+.SH NETWORK AND FIREWALL
+The host must accept incoming
+.B TCP port 5555
+for the game (or the port given with
+.BR \-\-port )
+and
+.B UDP port 5556
+for network search.
+The joining computer usually needs no changes.
+Joining by IP address only needs the TCP port.
+.PP
+With firewalld:
+.PP
+.RS
+.EX
+sudo firewall\-cmd \-\-add\-service=lanchess
+sudo firewall\-cmd \-\-permanent \-\-add\-service=lanchess
+.EE
+.RE
+.PP
+With ufw:
+.PP
+.RS
+.EX
+sudo ufw allow lanchess
+.EE
+.RE
+.PP
+Guest, hotel and public Wi\-Fi networks often isolate clients from each
+other; LAN play cannot work on them.
+.SH EXAMPLES
+On the first computer:
+.PP
+.RS
+.EX
+lanchess host \-\-time 5+3
+.EE
+.RE
+.PP
+On the second computer, search the network or give the host's address:
+.PP
+.RS
+.EX
+lanchess join
+lanchess join 192.168.1.23
+.EE
+.RE
+.PP
+A hot\-seat game with letters instead of symbols:
+.PP
+.RS
+.EX
+lanchess local \-\-ascii
+.EE
+.RE
+.SH SEE ALSO
+.BR firewall\-cmd (1),
+.BR ufw (8)
+.PP
+Project page: https://github.com/DeveshB\-1/lanchess
+.SH AUTHOR
+Devesh B <devesh.b@esds.co.in>

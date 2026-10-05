@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>LAN Chess</short>
+  <description>LAN Chess is a terminal chess game for two players on the same network. Enable this service on the computer that hosts a game: TCP port 5555 carries the game and UDP port 5556 answers network searches from players who want to join.</description>
+  <port protocol="tcp" port="5555"/>
+  <port protocol="udp" port="5556"/>
+</service>

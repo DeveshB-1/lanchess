@@ -1,0 +1,171 @@
+# Tag vX.Y.Z (matching __version__) to publish a GitHub release with the
+# Ubuntu .deb, the Arch package and the AUR recipe.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Tag matches __version__, unit tests pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Compare the tag with lanchess/__init__.py
+        run: |
+          version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' lanchess/__init__.py)"
+          if [ -z "$version" ] || [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ = \"$version\" in lanchess/__init__.py"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  packages:
+    name: Packages
+    needs: verify
+    uses: ./.github/workflows/packages.yml
+
+  aur:
+    name: AUR PKGBUILD and .SRCINFO for the tag archive
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: docker.io/library/archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed base-devel python hicolor-icon-theme namcap git
+      - uses: actions/checkout@v7
+      - name: Write the PKGBUILD with the sha256 of the GitHub tag archive, and its .SRCINFO
+        run: |
+          useradd --create-home builder
+          cp -a "$GITHUB_WORKSPACE" /home/builder/src
+          chown -R builder: /home/builder/src
+          su builder -c "cd ~/src && python3 packaging/build_packages.py --aur ~/aur"
+          cat /home/builder/aur/PKGBUILD /home/builder/aur/.SRCINFO
+      - name: Build the AUR recipe from the tag archive as an AUR user would (check() runs the unit tests)
+        run: |
+          su builder -c "cd ~/aur && makepkg --noconfirm --noprogressbar"
+          pacman -U --noconfirm /home/builder/aur/lanchess-*-any.pkg.tar.zst
+          lanchess --version
+          printf 'f3\ne5\ng4\nQh4#\n/quit\n' | lanchess local --plain --no-save | grep Checkmate
+          PATH=/usr/local/sbin:/usr/local/bin:/usr/bin namcap -i /home/builder/aur/PKGBUILD
+      # GitHub renames release files whose names start with a dot, so the
+      # .SRCINFO is attached as SRCINFO.
+      - name: Collect PKGBUILD and SRCINFO
+        run: |
+          mkdir -p aur
+          cp /home/builder/aur/PKGBUILD aur/PKGBUILD
+          cp /home/builder/aur/.SRCINFO aur/SRCINFO
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aur
+          path: aur/
+          if-no-files-found: error
+
+  publish:
+    name: Create the GitHub release
+    needs: [verify, packages, aur]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: aur
+          path: dist
+      - name: Write SHA256SUMS for the release files
+        env:
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          python3 packaging/build_packages.py --sums-only
+          for f in "lanchess_${V}-1_all.deb" "lanchess-${V}-1-any.pkg.tar.zst" PKGBUILD SRCINFO; do
+            grep -q "  $f\$" dist/SHA256SUMS || { echo "::error::dist/$f is missing"; exit 1; }
+          done
+      - name: Write the release notes
+        env:
+          V: ${{ needs.verify.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          **Ubuntu 20.04 or newer, Debian and Debian-based systems** (Linux Mint, Pop!_OS, ...):
+          download `lanchess_@V@-1_all.deb`, then
+
+          ```sh
+          sudo apt install ./lanchess_@V@-1_all.deb
+          ```
+
+          **Arch Linux and Arch-based systems** (Manjaro, EndeavourOS, ...):
+          download `lanchess-@V@-1-any.pkg.tar.zst`, then
+
+          ```sh
+          sudo pacman -U lanchess-@V@-1-any.pkg.tar.zst
+          ```
+
+          or, once LAN Chess is published on the AUR, `yay -S lanchess`.
+
+          **One-line installer** for Ubuntu/Debian and Arch: it downloads the right
+          package, checks it against `SHA256SUMS` and installs it with sudo.
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/@REPO@/main/install.sh | sh
+          ```
+
+          Other systems: run LAN Chess from source with Python 3.8 or newer:
+          `git clone https://github.com/@REPO@ && cd lanchess && python3 play.py`
+
+          ## Play
+
+          Run `lanchess host` on one computer and `lanchess join` on the other.
+          The host must allow **TCP 5555** and **UDP 5556** through its firewall
+          (`sudo ufw allow lanchess` or `sudo firewall-cmd --add-service=lanchess`).
+
+          ## Files
+
+          - `lanchess_@V@-1_all.deb`: Ubuntu, Debian and derivatives
+          - `lanchess-@V@-1-any.pkg.tar.zst`: Arch Linux and derivatives
+          - `PKGBUILD`, `SRCINFO`: the AUR recipe for this release (save `SRCINFO` as `.SRCINFO`)
+          - `SHA256SUMS`: check downloads with `sha256sum -c SHA256SUMS --ignore-missing`
+          NOTES
+          sed -i -e "s|@V@|$V|g" -e "s|@REPO@|$REPO|g" notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.verify.outputs.version }}
+        run: |
+          files=("dist/lanchess_${V}-1_all.deb" "dist/lanchess-${V}-1-any.pkg.tar.zst"
+                 dist/PKGBUILD dist/SRCINFO dist/SHA256SUMS)
+          ls -l "${files[@]}"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Re-run of a partly failed release: replace the files.
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "LAN Chess $V" --notes-file notes.md
+          fi

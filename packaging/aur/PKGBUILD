@@ -1,0 +1,33 @@
+# Maintainer: Devesh B <devesh.b@esds.co.in>
+#
+# AUR recipe for LAN Chess. It builds from the GitHub tag archive.
+#
+# The checksum of that archive only exists once the tag is pushed, so this
+# copy keeps sha256sums=('SKIP'). The release workflow (and
+# `python3 packaging/build_packages.py --aur DIR`) writes the ready-to-push
+# PKGBUILD with the real checksum and the maintainer from
+# packaging/channels.conf, plus its .SRCINFO, and attaches both to the GitHub
+# release. `build_packages.py --only arch` builds this recipe from a local
+# source tarball instead, for the .pkg.tar.zst release file.
+
+pkgname=lanchess
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Terminal chess for two players on the same network'
+arch=('any')
+url='https://github.com/DeveshB-1/lanchess'
+license=('MIT')
+depends=('python' 'hicolor-icon-theme')
+backup=('etc/ufw/applications.d/lanchess')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+check() {
+  cd "$pkgname-$pkgver"
+  PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  make DESTDIR="$pkgdir" PREFIX=/usr LAUNCHER_PYTHON=/usr/bin/python3 install
+}
