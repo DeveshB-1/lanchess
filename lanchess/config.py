@@ -20,8 +20,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from . import net
 from .game import TimeControl, parse_time_control
+from .ui import BOARD_SIZES
 
-__all__ = ["ENV_DIR", "FILENAME", "MAX_RECENT", "COLORS", "PIECE_STYLES", "Settings",
+__all__ = ["ENV_DIR", "FILENAME", "MAX_RECENT", "COLORS", "PIECE_STYLES", "BOARD_SIZES", "Settings",
            "config_dir", "config_path", "load", "save", "remember_host", "format_host"]
 
 ENV_DIR = "LANCHESS_CONFIG_DIR"
@@ -97,6 +98,7 @@ class Settings:
     host_color: str = "white"      # white, black or random
     port: int = net.DEFAULT_PORT
     piece_style: str = "unicode"   # unicode or ascii
+    board_size: str = "auto"       # auto, small, medium, large or xl (see ui.board_layout)
     colors: bool = True
     flip_local: bool = True        # turn the board to the side to move in local games
     autosave: bool = True
@@ -132,6 +134,7 @@ class Settings:
             host_color=_choice(data.get("host_color"), COLORS, base.host_color),
             port=_port(data.get("port"), base.port),
             piece_style=_choice(data.get("piece_style"), PIECE_STYLES, base.piece_style),
+            board_size=_choice(data.get("board_size"), BOARD_SIZES, base.board_size),
             colors=_flag(data.get("colors"), base.colors),
             flip_local=_flag(data.get("flip_local"), base.flip_local),
             autosave=_flag(data.get("autosave"), base.autosave),

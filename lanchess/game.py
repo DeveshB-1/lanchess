@@ -253,7 +253,7 @@ class GameSession:
                  opponent_name: str = "Opponent", conn: Any = None, time_control: Any = None,
                  fen: Optional[str] = STARTING_FEN, now_fn: Callable[[], float] = time.monotonic,
                  pgn_dir: Optional[str] = None, autosave: bool = True, flip: bool = True,
-                 unicode: bool = True) -> None:
+                 unicode: bool = True, board_size: str = "auto") -> None:
         if mode not in ("network", "local"):
             raise ValueError(f"mode must be 'network' or 'local', not {mode!r}")
         if mode == "network" and my_color not in (WHITE, BLACK):
@@ -275,6 +275,7 @@ class GameSession:
         self.autosave = autosave
         self.auto_flip = bool(flip) and self.local
         self.unicode = unicode
+        self.board_size = ui.normalize_board_size(board_size)  # auto, small, medium, large or xl (/size)
         self.quit_requested = False
         self.log: List[Tuple[str, str]] = []
         self.log_total = 0
@@ -640,6 +641,34 @@ class GameSession:
         base = (WHITE if self.local else self.my_color) or WHITE
         self.flipped = target != base
         self.dirty = True
+
+    def _cmd_size(self, arg: str) -> None:
+        """/size [auto|small|medium|large|xl] (a unique prefix will do); no argument: the next size.
+
+        Only this session changes: the saved default is set in the menu's Settings.
+        """
+        word = arg.strip().lower()
+        if not word:
+            size = ui.next_board_size(self.board_size)
+        else:
+            matches = [name for name in ui.BOARD_SIZES if name.startswith(word)]
+            if len(matches) != 1:
+                self._error(f"Unknown board size: {_one_line(arg, 20)}. "
+                            "Use /size auto, small, medium, large or xl (or just /size for the next one).")
+                return
+            size = matches[0]
+        self.board_size = size
+        self.dirty = True
+        if size == "auto":
+            text = "Board size: auto (the biggest board that fits the window)."
+        elif size == "small":
+            text = "Board size: small."
+        elif size in ("large", "xl") and not self.unicode:
+            text = f"Board size: {size}. Drawn pieces need chess symbols, so the letter board is shown."
+        else:
+            drawn = ", with drawn pieces" if size != "medium" else ""
+            text = f"Board size: {size}{drawn} (smaller while the window is too small for it)."
+        self._log("system", text)
 
     def _cmd_moves(self, arg: str) -> None:
         if self.over is not None:
@@ -1113,6 +1142,7 @@ class GameSession:
             connection=self._t(self.connection_text()),
             pending=self._t(self.pending_text()),
             log_scroll=self.log_scroll,
+            board_size=self.board_size,
         )
 
     def display_key(self) -> Tuple[Any, ...]:
@@ -1147,6 +1177,7 @@ _COMMANDS: Dict[str, Callable[[GameSession, str], None]] = {
     "accept": GameSession._cmd_accept, "decline": GameSession._cmd_decline,
     "takeback": GameSession._cmd_takeback, "undo": GameSession._cmd_takeback,
     "flip": GameSession._cmd_flip,
+    "size": GameSession._cmd_size,
     "moves": GameSession._cmd_moves,
     "fen": GameSession._cmd_fen,
     "pgn": GameSession._cmd_pgn,

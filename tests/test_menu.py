@@ -12,6 +12,7 @@ import errno
 import io
 import os
 import queue
+import socket
 import tempfile
 import threading
 import time
@@ -25,6 +26,19 @@ from lanchess.engine import STARTING_FEN
 from lanchess.game import TimeControl
 
 IPS = [("wlan0", "192.168.1.23"), ("eth0", "10.0.0.5")]
+
+
+def address_in_use_error() -> OSError:
+    """The error this OS really gives for listening on a port that is taken (its errno differs:
+    98 on Linux, 48 on macOS, 10048 on Windows)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        try:
+            net.Server(port=holder.getsockname()[1], bind="127.0.0.1").close()
+        except OSError as exc:
+            return exc
+    raise AssertionError("listening twice on one port did not fail")
 
 
 # -- fakes ------------------------------------------------------------------------------------
@@ -633,17 +647,19 @@ class WaitingTests(MenuTestCase):
         release.set()
 
     def test_port_in_use_and_discovery_unavailable(self) -> None:
-        def busy(port: int) -> Any:
-            raise OSError(98, "Address already in use")
+        for error in (OSError(errno.EADDRINUSE, "Address already in use"), address_in_use_error()):
+            def busy(port: int, error: OSError = error) -> Any:
+                raise error
 
-        ctx = self.make_ctx(server_factory=busy)
-        screen = menu.WaitingScreen(ctx, "white", None, 5555)
-        text = self.frame(screen, ctx)
-        self.assertIn("Could not host the game: port 5555 is already in use", text)
-        self.assertIn("pick another port, for example 6000", flat(text))
-        self.assertNotIn("--port", text)
-        self.assertEqual(screen.handle_key(term.ESCAPE).kind, "pop")
-        screen.on_leave()
+            with self.subTest(error=error):
+                ctx = self.make_ctx(server_factory=busy)
+                screen = menu.WaitingScreen(ctx, "white", None, 5555)
+                text = self.frame(screen, ctx)
+                self.assertIn("Could not host the game: port 5555 is already in use", text)
+                self.assertIn("pick another port, for example 6000", flat(text))
+                self.assertNotIn("--port", text)
+                self.assertEqual(screen.handle_key(term.ESCAPE).kind, "pop")
+                screen.on_leave()
         self.responder_ok = False
         ctx, screen = self.waiting()
         self.assertIn("Network search: off", self.frame(screen, ctx))
@@ -1037,6 +1053,7 @@ class SettingsTests(MenuTestCase):
         self.press(screen, term.DOWN, term.RIGHT)  # host colour black
         self.press(screen, term.DOWN, term.BACKSPACE, "6")  # port 5556
         self.press(screen, term.DOWN, term.RIGHT)  # letters
+        self.press(screen, term.DOWN, term.LEFT)  # board size xl (wraps backwards from auto)
         self.press(screen, term.DOWN, term.RIGHT)  # colours off
         self.press(screen, term.DOWN, term.RIGHT)  # flip off
         self.press(screen, term.DOWN, term.RIGHT)  # autosave off
@@ -1046,8 +1063,8 @@ class SettingsTests(MenuTestCase):
         self.assertEqual(action.message, (("ok", "Settings saved."),))
         saved = config.load(self.config_path)
         self.assertEqual(saved, config.Settings(name="Alice", time_control="5+3", host_color="black", port=5556,
-                                                piece_style="ascii", colors=False, flip_local=False,
-                                                autosave=False, pgn_dir="/tmp/games"))
+                                                piece_style="ascii", board_size="xl", colors=False,
+                                                flip_local=False, autosave=False, pgn_dir="/tmp/games"))
         self.assertEqual(ctx.settings, saved)
         options = ctx.options()
         self.assertEqual((options.ascii, options.no_color, options.no_save, options.pgn_dir),
@@ -1091,7 +1108,7 @@ class SettingsTests(MenuTestCase):
 
     def test_save_failure_is_reported(self) -> None:
         blocker = os.path.join(self.tmp, "file")
-        with open(blocker, "w") as handle:
+        with open(blocker, "w", encoding="utf-8") as handle:
             handle.write("x")
         ctx = self.make_ctx()
         ctx.config_path = os.path.join(blocker, "config.json")
@@ -1180,6 +1197,31 @@ class ContextTests(MenuTestCase):
         while ctx.local_ips() == IPS and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertEqual(ctx.local_ips(), [("eth1", "10.1.1.1")])
+
+    def test_a_slow_first_ip_lookup_does_not_freeze_the_menu(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def lookup() -> List[Tuple[str, str]]:
+            release.wait(5)
+            return list(IPS)
+
+        ctx = self.make_ctx(local_ips=lookup, threaded=True)
+        started = time.monotonic()
+        self.assertEqual(ctx.local_ips(), [])
+        self.assertTrue(ctx.ips_pending)
+        self.assertIn("Your IP: looking it up…", self.frame(menu.MainMenu(ctx), ctx))
+        waiting = menu.WaitingScreen(ctx, "white", None, 5555)
+        self.assertIn("Looking up this computer's IP address…", self.frame(waiting, ctx))
+        waiting.on_leave()
+        self.assertLess(time.monotonic() - started, 1.0)  # (the first call waited FIRST_IPS_WAIT at most)
+        release.set()
+        deadline = time.monotonic() + 5
+        while ctx.local_ips() != IPS and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(ctx.local_ips(), IPS)
+        self.assertFalse(ctx.ips_pending)
+        self.assertIn("Your IP: 192.168.1.23 (wlan0)", self.frame(menu.MainMenu(ctx), ctx))
 
     def test_ip_lookup_failure(self) -> None:
         def broken() -> List[Tuple[str, str]]:

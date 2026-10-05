@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import queue
 import socket
+import struct
+import sys
 import threading
 import time
 import unittest
 import unicodedata
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from unittest import mock
 
 from lanchess import net
 from lanchess.net import (
@@ -17,6 +21,11 @@ from lanchess.net import (
     HandshakeError, HostInfo, Server, broadcast_targets, client_handshake, connect, discover_hosts,
     local_ip_addresses, parse_host_port, sanitize_name, server_handshake,
 )
+
+try:
+    from .support import watch_threads
+except ImportError:  # (the tests folder itself is on sys.path: unittest discover -s tests)
+    from support import watch_threads
 
 LOCALHOST = "127.0.0.1"
 WAIT = 3.0
@@ -84,16 +93,7 @@ class LineReader:
 
 class NetTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.addCleanup(self.assert_no_leaked_threads)
-
-    def assert_no_leaked_threads(self) -> None:
-        deadline = time.monotonic() + WAIT
-        while True:
-            leftovers = [t.name for t in threading.enumerate() if t.name.startswith("lanchess-")]
-            if not leftovers or time.monotonic() > deadline:
-                break
-            time.sleep(0.02)
-        self.assertEqual(leftovers, [])
+        watch_threads(self, WAIT)
 
     def get(self, conn: Connection, timeout: float = WAIT) -> Dict[str, Any]:
         try:
@@ -135,6 +135,30 @@ class NetTestCase(unittest.TestCase):
         conn = Connection(accepted, **options).start()
         self.addCleanup(conn.close)
         return conn, raw
+
+    def wrapped_pair(self, socket_class: type, **options: Any) -> Tuple[Connection, socket.socket]:
+        """Like raw_pair, but the Connection's socket is a ``socket_class`` (a socket subclass)."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind((LOCALHOST, 0))
+            listener.listen(1)
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.addCleanup(raw.close)
+            raw.settimeout(WAIT)
+            raw.connect(listener.getsockname())
+            accepted, _address = listener.accept()
+        sock = socket_class(fileno=accepted.detach())
+        conn = Connection(sock, **options).start()
+        self.addCleanup(conn.close)
+        return conn, raw
+
+
+class DripSocket(socket.socket):
+    """A socket that sends at most 1 KB per send() call, 20 ms apart: like a peer that keeps reading,
+    slowly, so every call makes progress but a long message takes far longer than its timeout."""
+
+    def send(self, data: Any, flags: int = 0) -> int:
+        time.sleep(0.02)
+        return super().send(bytes(memoryview(data)[:1024]), flags)
 
 
 class ConnectionTests(NetTestCase):
@@ -359,6 +383,117 @@ class ConnectionTests(NetTestCase):
         self.assertEqual(self.get(conn), {"type": "_disconnected", "reason": "send timed out"})
         self.assertTrue(conn.closed)
 
+    def test_a_slow_reader_cannot_stretch_a_send_past_its_timeout(self) -> None:
+        conn, _raw = self.wrapped_pair(DripSocket, ping_interval=None, idle_timeout=None, send_timeout=0.3)
+        started = time.monotonic()
+        with self.assertRaises(ConnectionClosed):
+            conn.send({"type": "chat", "text": "z" * 60000})  # (60 sends of 1 KB: 1.2 s)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(self.get(conn), {"type": "_disconnected", "reason": "send timed out"})
+
+    def test_send_gives_up_at_its_deadline_not_at_the_next_poll(self) -> None:
+        # The socket's own timeout is the reader's poll interval (here made long): a send that is
+        # stuck must still give up when send_timeout has passed, not when the next poll would end.
+        with mock.patch.object(net, "_POLL_INTERVAL", 1.0):
+            conn, _raw = self.raw_pair(small_buffers=True, ping_interval=None, idle_timeout=None, send_timeout=1.2)
+            with self.assertRaises(ConnectionClosed):
+                for _ in range(5000):
+                    started = time.monotonic()
+                    conn.send({"type": "chat", "text": "z" * 60000})
+            elapsed = time.monotonic() - started  # (of the send that timed out)
+        self.assertGreaterEqual(elapsed, 1.15)
+        self.assertLess(elapsed, 1.7)  # (giving up at the poll after the deadline: 2 s)
+        self.assertEqual(self.get(conn), {"type": "_disconnected", "reason": "send timed out"})
+
+    def test_sends_without_poll_as_on_windows(self) -> None:
+        with mock.patch.object(net, "select", mock.Mock(spec=["select"], select=net.select.select)):
+            host, guest = self.pair()
+            guest.send({"type": "chat", "text": "via select"})
+            self.assertEqual(self.get(host), {"type": "chat", "text": "via select"})
+            conn, _raw = self.raw_pair(small_buffers=True, ping_interval=None, idle_timeout=None, send_timeout=0.3)
+            with self.assertRaises(ConnectionClosed):
+                for _ in range(5000):
+                    started = time.monotonic()
+                    conn.send({"type": "chat", "text": "z" * 60000})
+            self.assertLess(time.monotonic() - started, 1.0)
+
+
+class NoWakeSocket(socket.socket):
+    """A socket whose shutdown() does nothing. Like a macOS socket, where neither shutdown() nor
+    close() from another thread wakes a thread blocked in recv (nor does close() on Linux)."""
+
+    def shutdown(self, how: int) -> None:
+        pass
+
+
+class CloseTests(NetTestCase):
+    """close() must end the reader and heartbeat threads promptly on every OS."""
+
+    def no_wake_pair(self, **options: Any) -> Tuple[Connection, socket.socket]:
+        """Like raw_pair, but the Connection's socket is a NoWakeSocket."""
+        return self.wrapped_pair(NoWakeSocket, **options)
+
+    def assert_closes_promptly(self, conn: Connection) -> None:
+        time.sleep(0.1)  # the reader is now blocked waiting for data
+        started = time.monotonic()
+        conn.close()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual([t.name for t in conn._threads if t.is_alive()], [])
+        self.assertEqual(conn._sock.fileno(), -1)  # closed (by the reader, as it stopped)
+
+    def test_close_ends_the_threads_even_when_shutdown_does_not_wake_recv(self) -> None:
+        conn, raw = self.no_wake_pair(ping_interval=0.05, idle_timeout=30)
+        self.assertEqual(LineReader(raw).next_message(skip=()), {"type": "ping"})
+        self.assertEqual(len(conn._threads), 2)  # reader and heartbeat
+        self.assert_closes_promptly(conn)
+        raw.settimeout(WAIT)
+        while raw.recv(4096):  # pings sent before the close, then the end of the stream
+            pass
+
+    def test_close_from_another_thread(self) -> None:
+        conn, _raw = self.no_wake_pair(ping_interval=None, idle_timeout=None)
+        wait = run_in_thread(self.assert_closes_promptly, conn)
+        wait()
+        self.assert_quiet(conn)
+
+    def test_peer_reset_while_closing(self) -> None:
+        conn, raw = self.raw_pair(ping_interval=None, idle_timeout=None)
+        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        raw.close()  # RST: on macOS a later shutdown() fails with ENOTCONN
+        self.assertEqual(self.get(conn)["type"], "_disconnected")
+        self.assert_closes_promptly(conn)
+
+    def test_failure_noticed_by_the_heartbeat_closes_the_socket(self) -> None:
+        conn, raw = self.no_wake_pair(ping_interval=None, idle_timeout=0.3)
+        self.assertEqual(self.get(conn), {"type": "_disconnected", "reason": "timed out"})
+        deadline = time.monotonic() + WAIT
+        while conn._sock.fileno() != -1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(conn._sock.fileno(), -1)  # without close(): the reader stopped and closed it
+        self.assertEqual([t.name for t in conn._threads if t.is_alive()], [])
+
+    def test_send_blocked_on_a_full_buffer_ends_when_closed(self) -> None:
+        conn, _raw = self.raw_pair(small_buffers=True, ping_interval=None, idle_timeout=None)
+        outcome: List[BaseException] = []
+
+        def flood() -> None:
+            try:
+                while True:
+                    conn.send({"type": "chat", "text": "z" * 60000})
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=flood, daemon=True)
+        thread.start()
+        time.sleep(0.3)  # the peer reads nothing: the send is now waiting for buffer space
+        started = time.monotonic()
+        conn.close()
+        thread.join(WAIT)
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(len(outcome), 1)
+        self.assertIsInstance(outcome[0], ConnectionClosed)
+
 
 class ServerTests(NetTestCase):
     def test_accept_returns_none_on_timeout(self) -> None:
@@ -376,6 +511,51 @@ class ServerTests(NetTestCase):
                     self.assertIsInstance(host, Connection)
                     guest.send({"type": "hi"})
                     self.assertEqual(self.get(host), {"type": "hi"})
+
+    def fake_listener(self, server: Server) -> mock.Mock:
+        """Replace the server's listening socket by a mock wrapping it (to make accept() fail)."""
+        real = server._sock
+        self.addCleanup(real.close)
+        server._sock = fake = mock.Mock(wraps=real)
+        return fake
+
+    def test_accept_skips_a_client_that_gave_up(self) -> None:
+        aborted = ConnectionAbortedError(errno.ECONNABORTED, "Software caused connection abort")
+        reset = ConnectionResetError(errno.ECONNRESET, "Connection reset by peer")
+        # Linux reports a new connection's pending network error from accept(): retried there only.
+        network = [OSError(getattr(errno, name), name) for name in ("EPROTO", "ENETDOWN") if hasattr(errno, name)]
+        for linux in (True, False):
+            with Server(port=0, bind=LOCALHOST) as server, mock.patch.object(net, "_IS_LINUX", linux):
+                fake = self.fake_listener(server)
+                for error in [aborted, reset] + network:
+                    with self.subTest(linux=linux, error=error):
+                        fake.accept.side_effect = error
+                        if linux or isinstance(error, ConnectionError):
+                            self.assertIsNone(server.accept(0.1))
+                        else:  # (e.g. Windows' WSAENETDOWN: the network subsystem has failed)
+                            with self.assertRaises(OSError):
+                                server.accept(0.1)
+                fake.accept.side_effect = OSError(errno.EBADF, "Bad file descriptor")
+                with self.assertRaises(OSError):
+                    server.accept(0.1)
+
+    def test_accept_raises_a_client_error_that_never_stops(self) -> None:
+        with Server(port=0, bind=LOCALHOST) as server:
+            fake = self.fake_listener(server)
+            error = ConnectionAbortedError(errno.ECONNABORTED, "Software caused connection abort")
+            fake.accept.side_effect = error
+            for _ in range(net._ACCEPT_ERROR_BURST):  # (as many clients as can plausibly give up at once)
+                self.assertIsNone(server.accept(0.1))
+            fake.accept.side_effect = None  # a client gets through: the count starts again
+            with connect(LOCALHOST, server.port, timeout=WAIT) as guest:
+                with server.accept(WAIT) as host:  # type: ignore[union-attr]
+                    self.assertIsInstance(host, Connection)
+            fake.accept.side_effect = error
+            for _ in range(net._ACCEPT_ERROR_BURST):
+                self.assertIsNone(server.accept(0.1))
+            with self.assertRaises(ConnectionAbortedError):  # instead of the caller retrying at full speed
+                for _ in range(100 * net._ACCEPT_ERROR_BURST):
+                    server.accept(0.1)
 
     def test_port_in_use_raises_oserror(self) -> None:
         with Server(port=0, bind=LOCALHOST) as server:
@@ -594,6 +774,142 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(len(set(targets)), len(targets))
         for target in targets:
             socket.inet_aton(target)
+
+
+class SlowResolverTests(NetTestCase):
+    """Resolving this computer's own name can take half a minute (macOS, when DNS and mDNS do
+    not know it): nothing may wait for that."""
+
+    ADDRESS = "192.168.77.5"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        self.lookups: List[Any] = []
+
+        def slow(answer: Any) -> Callable[..., Any]:
+            def lookup(*args: Any, **kwargs: Any) -> Any:
+                self.lookups.append(args)
+                self.release.wait(WAIT * 2)
+                return answer
+            return lookup
+
+        self.cache = net._HostnameAddresses()
+        for target, name, value in (
+                (net, "_interfaces", lambda: []),  # (no interface list from the kernel, as on Windows)
+                (net, "_HOSTNAME_ADDRESSES", self.cache),
+                (socket, "getaddrinfo", slow([(socket.AF_INET, socket.SOCK_DGRAM, 17, "", (self.ADDRESS, 0))])),
+                (socket, "gethostbyname", slow(self.ADDRESS)),
+                (socket, "gethostbyname_ex", slow(("box", [], [self.ADDRESS]))),
+                (socket, "getfqdn", slow("box.local"))):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def wait_for_the_lookup(self) -> None:
+        self.release.set()
+        deadline = time.monotonic() + WAIT
+        while self.cache._running is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(self.cache._running)
+
+    def test_local_ip_addresses_waits_briefly_then_uses_the_answer_when_it_comes(self) -> None:
+        started = time.monotonic()
+        first = local_ip_addresses()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertNotIn(("", self.ADDRESS), first)
+        started = time.monotonic()
+        for _ in range(5):  # while the lookup runs, nobody waits for it again
+            local_ip_addresses()
+            broadcast_targets()
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertEqual(len(self.lookups), 1)
+        self.wait_for_the_lookup()
+        self.assertIn(("", self.ADDRESS), local_ip_addresses())
+        self.assertIn("192.168.77.255", broadcast_targets())
+        self.assertEqual(len(self.lookups), 1)  # cached
+
+    def test_discovery_does_not_wait_for_the_lookup(self) -> None:
+        started = time.monotonic()
+        hosts = discover_hosts(timeout=0.3, discovery_port=free_port(socket.SOCK_DGRAM),
+                               extra_targets=[LOCALHOST])
+        self.assertEqual(hosts, [])
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.wait_for_the_lookup()
+
+    def test_a_failed_lookup_means_no_addresses_from_the_name(self) -> None:
+        def broken() -> List[str]:
+            raise OSError(errno.EAGAIN, "Temporary failure in name resolution")
+
+        cache = net._HostnameAddresses(broken)
+        self.assertEqual(cache.get(WAIT), [])
+        self.assertIsNone(cache._running)
+
+
+class InterfaceQueryTests(unittest.TestCase):
+    """The ioctl interface list, with the kernel replaced by a fake that answers like macOS."""
+
+    BSD = {"flags": 0xC0206911, "addr": 0xC0206921, "broadcast": 0xC0206923}
+
+    def fake_ioctl(self, interfaces: Dict[str, Tuple[int, Optional[str], Optional[str]]]) -> Callable[..., bytes]:
+        def sockaddr_in(address: str) -> bytes:  # BSD: sin_len, sin_family, sin_port, sin_addr, zero
+            return bytes([16, socket.AF_INET]) + b"\0\0" + socket.inet_aton(address) + b"\0" * 8
+
+        def ioctl(fd: int, request: int, ifreq: bytes) -> bytes:
+            name = ifreq[:16].rstrip(b"\0").decode()
+            flags, address, broadcast = interfaces[name]
+            if request == self.BSD["flags"]:
+                value = struct.pack("H", flags)
+            elif request == self.BSD["addr"] and address:
+                value = sockaddr_in(address)
+            elif request == self.BSD["broadcast"] and broadcast:
+                value = sockaddr_in(broadcast)
+            else:
+                raise OSError(errno.EADDRNOTAVAIL, "Can't assign requested address")
+            return (ifreq[:16] + value).ljust(len(ifreq), b"\0")
+
+        return ioctl
+
+    def test_macos_layout(self) -> None:
+        up, broadcast, loopback, p2p = 0x1, 0x2, 0x8, 0x10
+        interfaces = {"lo0": (up | loopback, "127.0.0.1", None),
+                      "en0": (up | broadcast, "192.168.1.23", "192.168.1.255"),
+                      "en1": (broadcast, "10.9.9.9", "10.9.9.255"),          # down
+                      "utun0": (up | p2p, None, None),                       # IPv6 only
+                      "en5": (up | broadcast, "169.254.10.20", "169.254.255.255")}
+        fake_fcntl = mock.Mock(ioctl=self.fake_ioctl(interfaces))
+        names = [(index, name) for index, name in enumerate(interfaces, 1)]
+        with mock.patch.multiple(net, fcntl=fake_fcntl, _IS_LINUX=False, _SIOCGIFFLAGS=self.BSD["flags"],
+                                 _SIOCGIFADDR=self.BSD["addr"], _SIOCGIFBRDADDR=self.BSD["broadcast"]), \
+                mock.patch.object(socket, "if_nameindex", return_value=names, create=True):
+            self.assertEqual(net._interfaces(), [("en0", "192.168.1.23", "192.168.1.255"),
+                                                 ("en5", "169.254.10.20", "169.254.255.255")])
+            with mock.patch.object(net, "_primary_ipv4", return_value="192.168.1.23"):
+                self.assertEqual(local_ip_addresses(), [("en0", "192.168.1.23"), ("en5", "169.254.10.20")])
+
+    def test_without_ioctl(self) -> None:
+        with mock.patch.object(net, "fcntl", None):
+            self.assertEqual(net._interfaces(), [])
+
+
+@unittest.skipUnless(sys.platform.startswith(("linux", "freebsd")) or sys.platform == "darwin",
+                     "the kernel is asked for its interfaces on Linux, macOS and FreeBSD")
+class RealInterfaceTests(unittest.TestCase):
+    """The ioctl interface list against the real kernel. Wrong request numbers or struct offsets
+    would leave it empty or wrong, and the program would quietly fall back to the slow host-name
+    lookup (the tests above only check the layout against a fake kernel)."""
+
+    def test_the_address_of_the_default_route_is_listed(self) -> None:
+        primary = net._primary_ipv4()
+        if primary is None:
+            self.skipTest("no default route")
+        interfaces = net._interfaces()
+        self.assertIn(primary, [address for _name, address, _broadcast in interfaces], interfaces)
+        for name, address, broadcast in interfaces:
+            self.assertTrue(name)
+            self.assertTrue(net._is_usable_ipv4(address), address)
+            self.assertTrue(broadcast is None or net._is_usable_ipv4(broadcast), broadcast)
 
 
 class DiscoveryTests(NetTestCase):

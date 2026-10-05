@@ -23,12 +23,12 @@ Type a move like e4, Nf3, exd5, O-O or e2e4 and press Enter.
 Black>
 ```
 
-<sub>A local game with `--no-color` in a 100×30 terminal. With colours on, the squares are shaded
-and the board is drawn larger.</sub>
+<sub>A local game with `--no-color` in a 100×30 terminal. With colours on, the squares are shaded,
+and in a big window the pieces are drawn large with block graphics (see [Board size](#board-size)).</sub>
 
 **Contents:** [Install](#install) · [Play on two computers](#play-on-two-computers) ·
 [Firewall](#firewall) · [Entering moves](#entering-moves) · [In-game commands](#in-game-commands) ·
-[Keys](#keys) · [Menu and settings](#menu-and-settings) · [Time controls](#time-controls) ·
+[Board size](#board-size) · [Keys](#keys) · [Menu and settings](#menu-and-settings) · [Time controls](#time-controls) ·
 [Local game](#local-hot-seat-game) · [Saved games](#saved-games-pgn) ·
 [Troubleshooting](#troubleshooting) · [Command-line reference](#command-line-reference) ·
 [Development](#development)
@@ -194,6 +194,7 @@ optional.
 | `/resign` | Resign the game |
 | `/rematch` | After the game ends, offer a rematch (colours swap, same time control) |
 | `/flip` | Turn the board around |
+| `/size [size]` | Board and piece size: `auto`, `small`, `medium`, `large` or `xl`; without a size, the next one (see [Board size](#board-size)) |
 | `/moves` | List the legal moves |
 | `/fen` | Show the position as FEN |
 | `/pgn` | Show the game so far as PGN |
@@ -210,6 +211,34 @@ optional.
   10 seconds resigns and leaves. After the game ends, `/quit` leaves at once.
 - **Disconnects:** if the other player leaves or the connection drops, the game ends as abandoned
   (result `*`) and is still saved if any moves were played.
+
+## Board size
+
+The board grows with the window. With the default size, **auto**, a game uses the biggest board
+that fits and checks again on every redraw, so making the window bigger or smaller changes the
+size at once. From **large** up, the pieces are drawn with block characters (two square pixels per
+character cell) instead of one chess symbol per square:
+
+| Size | Square (columns × rows) | Pieces | Window needed (with the side panel) |
+|---|---|---|---|
+| small | 3×1 | chess symbol or letter | any |
+| medium | 5×2 or 7×3 | chess symbol or letter on coloured squares | 77×24 or 93×32 |
+| large | 8×4 or 10×5 | drawn, 8 or 10 pixels tall | 99×36 or 115×44 |
+| xl | 12×6, 14×7 or 16×8 | drawn, 12 to 16 pixels tall | 131×52, 147×60 or 163×68 |
+
+Tall windows that are too narrow for the side panel put the players and moves below the board
+instead. Beside a drawn board the message log moves into the side panel, so the board can use
+nearly the whole height.
+
+Choose a size with *Board size* in Settings (saved; games started from the menu use it), or with
+`/size` during any game (that game only; `/size` alone steps auto → small → medium → large → xl).
+A chosen size is an upper limit: while the window is too small for it, the biggest smaller size
+that fits is shown.
+
+Drawn pieces need chess symbols and colours. With `--ascii` the board stays small or medium,
+with letters. With `--no-color` it is small, or in a window big enough for the 14×7 squares a
+black-and-white diagram: White pieces as outlines, Black pieces solid, dark squares shaded and
+the last move marked with corners.
 
 ## Keys
 
@@ -255,8 +284,8 @@ A game started from the menu returns to the menu when you `/quit`. With `--plain
 isn't a terminal, the menu is a numbered text menu instead: type `1`–`6` and press Enter.
 
 **Settings:** your name (default: your login name), the default time control, the colour you play
-when hosting, the port, chess symbols or letters for the pieces, colours on or off, whether the
-board turns in local games, whether finished games are saved, and the games folder. The Join
+when hosting, the port, chess symbols or letters for the pieces, the board size, colours on or
+off, whether the board turns in local games, whether finished games are saved, and the games folder. The Join
 screen also lists the last five hosts you joined.
 
 Settings are saved in `config.json` here:
@@ -326,6 +355,8 @@ program or website can open them.
 | "Port … is already in use" | Another LAN Chess game or another program uses that port. Pick another port on the Host form, in Settings, or with `lanchess host --port 6000`; the other player then joins `IP:6000`. |
 | Colours or chess symbols look wrong | Use `--ascii` (letters instead of symbols), `--no-color`, or `--plain` (line-by-line output), or change *Pieces* and *Colours* in Settings. The `NO_COLOR` environment variable also turns colours off. Chess symbols need a font that has them, such as DejaVu Sans Mono. |
 | "Terminal too small" | Make the window bigger; the menu needs at least 40×14. |
+| Drawn pieces look striped or have gaps | The terminal adds space between lines, or the font lacks block characters. Set the line spacing to 1.0, use a font such as DejaVu Sans Mono, or use `/size medium` (or *Board size* in Settings). |
+| The board is too big or too small | `/size small`, `/size medium` and so on, or *Board size* in Settings. `auto` follows the window size. |
 | The screen is garbled after resizing | Press Ctrl-L. |
 | A move is rejected | Check whose turn it is. `/moves` lists the legal moves, and chat needs `/c`. |
 

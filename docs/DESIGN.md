@@ -118,20 +118,35 @@ Every message has a string field `"type"`.
     continue. Line longer than MAX_LINE → disconnect.
   - On EOF / socket error / timeout put exactly one `{"type":"_disconnected","reason":"..."}` then stop.
     After a local `close()` no `_disconnected` event is required.
-  - `.send(msg: dict)` thread-safe (lock), raises `ConnectionClosed` if closed or on socket error.
-  - `.close()` idempotent; `.closed` bool; `.peer: str` like `"10.0.0.5:5555"`.
+  - `.send(msg: dict)` thread-safe (lock), raises `ConnectionClosed` if closed or on socket error;
+    a whole message may take at most `send_timeout` (10 s) seconds.
+  - `.close()` idempotent, waits for the threads to stop; `.closed` bool; `.peer: str` like `"10.0.0.5:5555"`.
+  - Portability: the socket timeout is a short poll interval (0.25 s), so the reader re-checks for
+    `close()` at least that often; on macOS and the BSDs neither `shutdown()` nor `close()` from another
+    thread reliably wakes a thread blocked in `recv`. `close()` shuts the socket down and the reader
+    closes the descriptor as it exits (never under a thread still using it). As that timeout is the
+    reader's, `send` waits for buffer space itself (`poll`, or `select` on Windows), each wait bounded by
+    what is left of `send_timeout`, so a peer that reads slowly cannot stretch a message past it.
 - `class Server(port=DEFAULT_PORT, bind="0.0.0.0")`: listening socket with SO_REUSEADDR (not on Windows
   — use SO_EXCLUSIVEADDRUSE semantics there or just skip), `.port` (actual bound port; port 0 allowed for
   tests), `.accept(timeout) -> Optional[Connection]` (returns a *started* Connection, or None on timeout —
-  lets callers poll for Ctrl-C), `.close()`. Raises `OSError` from constructor if port busy.
+  lets callers poll for Ctrl-C — or when the client gave up before it was accepted: a `ConnectionError`
+  such as ECONNABORTED, and on Linux also the pending network errors that accept(2) says to retry;
+  more than 50 of those within a second are raised instead, as the error is then not about clients),
+  `.close()`. Raises `OSError` from constructor if port busy.
 - `connect(host, port=DEFAULT_PORT, timeout=10.0) -> Connection` (started).
 - `parse_host_port(text, default_port=DEFAULT_PORT) -> Tuple[str,int]` (`"10.0.0.5"`, `"10.0.0.5:6000"`,
   `"myhost:6000"`; raises `ValueError` on bad port).
-- `local_ip_addresses() -> List[Tuple[str,str]]` — `(interface_name_or_"", ipv4)` for non-loopback IPv4
-  addresses, best effort, never raises. Linux: enumerate interfaces via `socket.if_nameindex()` + `fcntl.ioctl`
-  SIOCGIFADDR. Fallbacks: `getaddrinfo(gethostname())`, UDP-connect trick to 8.8.8.8 (no packets sent).
-- `broadcast_targets() -> List[str]` — `"255.255.255.255"`, real per-interface broadcast addresses
-  (Linux ioctl SIOCGIFBRDADDR), and `x.y.z.255` guesses for each local IP; deduplicated; never raises.
+- `local_ip_addresses(wait=0.5) -> List[Tuple[str,str]]` — `(interface_name_or_"", ipv4)` for non-loopback
+  IPv4 addresses, best effort, never raises, never blocks on name resolution. Linux, macOS and FreeBSD:
+  enumerate interfaces via `socket.if_nameindex()` + `fcntl.ioctl` SIOCGIFFLAGS/SIOCGIFADDR (same `struct
+  ifreq` offsets, different request numbers). Plus the UDP-connect trick to 8.8.8.8 (no packets sent).
+  Elsewhere (Windows) or if that finds nothing: `getaddrinfo(gethostname())` in a background thread, cached
+  for 60 s; a caller waits at most `wait` seconds for its first answer (resolving the own host name can
+  take half a minute on macOS when DNS/mDNS do not know it).
+- `broadcast_targets(wait=0.0) -> List[str]` — `"255.255.255.255"`, real per-interface broadcast addresses
+  (ioctl SIOCGIFBRDADDR), and `x.y.z.255` guesses for each local IP; deduplicated; never raises; by default
+  never waits for a host-name lookup.
 - `HostInfo = namedtuple("HostInfo", "name address port")`.
 - `class DiscoveryResponder(name, game_port, discovery_port=DISCOVERY_PORT)`: `.start() -> bool` binds UDP
   `("", discovery_port)` (SO_REUSEADDR) in a daemon thread; returns False (no exception) if bind fails.
@@ -139,7 +154,7 @@ Every message has a string field `"type"`.
   `{"app":"lanchess","type":"announce","v":1,"name":name,"port":game_port}`. Ignores anything else. `.stop()`.
 - `discover_hosts(timeout=2.5, discovery_port=DISCOVERY_PORT, extra_targets=()) -> List[HostInfo]` — UDP socket
   with SO_BROADCAST; sends the discover datagram to every `broadcast_targets()` + `extra_targets` address
-  (ignore per-target send errors) every 0.5 s until timeout; collects announces, dedup by (address, port),
+  (ignore per-target send errors; the targets are recomputed for each burst) every 0.5 s until timeout; collects announces, dedup by (address, port),
   address = sender IP. Never raises on network errors (returns what it found).
 - Handshake (blocking helpers, read from `conn.inbox`, ignore unrelated messages, `timeout` seconds):
   - `client_handshake(conn, my_name, timeout=10.0) -> dict` sends

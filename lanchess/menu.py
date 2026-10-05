@@ -57,6 +57,10 @@ TIME_PRESETS: Tuple[Tuple[str, str], ...] = (
 )
 COLOR_CHOICES: Tuple[Tuple[str, str], ...] = (("white", "White"), ("black", "Black"), ("random", "Random"))
 ON_OFF: Tuple[Tuple[bool, str], ...] = ((True, "On"), (False, "Off"))
+BOARD_SIZE_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("auto", "Auto (biggest that fits)"), ("small", "Small"), ("medium", "Medium"),
+    ("large", "Large (drawn pieces)"), ("xl", "Extra large (drawn pieces)"),
+)
 TIME_CHARS = "0123456789.+| "
 
 Message = Tuple[str, str]  # (kind, text); kind is info, ok, notice or error
@@ -136,9 +140,11 @@ def _labelled(s: Style, label: str, text: str, width: int, paint: Callable[[str]
     return parts
 
 
-def ip_summary(ips: Sequence[Tuple[str, str]]) -> str:
-    """``Your IP: 192.168.1.23 (wlan0), …`` for the footer."""
+def ip_summary(ips: Sequence[Tuple[str, str]], pending: bool = False) -> str:
+    """``Your IP: 192.168.1.23 (wlan0), …`` for the footer (``pending``: still being looked up)."""
     if not ips:
+        if pending:
+            return "Your IP: looking it up…"
         return "Your IP: not found (is this computer connected to a network?)"
     return "Your IP: " + ", ".join(f"{address} ({iface})" if iface else address for iface, address in ips)
 
@@ -453,6 +459,8 @@ def firewall_hint(kind: Optional[str], port: int) -> List[str]:
 class MenuContext:
     """Settings plus every outside dependency of the menu (all replaceable for tests)."""
 
+    FIRST_IPS_WAIT = 0.25  # seconds the first local_ips() call waits before showing "looking it up"
+
     def __init__(self, settings: Optional[config.Settings] = None, explicit: Optional[Dict[str, Any]] = None,
                  config_path: Optional[str] = None, *, theme: Optional[ui.Theme] = None,
                  color_ok: bool = True, clock: Callable[[], float] = time.monotonic,
@@ -536,23 +544,27 @@ class MenuContext:
             return []
 
     def local_ips(self) -> List[Tuple[str, str]]:
-        """This computer's LAN addresses: looked up once, then refreshed every 10 s in the background
-        (a lookup can be slow on some systems, and the menu must never freeze)."""
+        """This computer's LAN addresses, looked up in the background and refreshed every 10 s (a
+        lookup can be slow on some systems, and the menu must never freeze). The first call waits
+        ``FIRST_IPS_WAIT`` seconds at most; until the first answer the list is empty and
+        ``ips_pending`` is True."""
         now = self.clock()
+        if self._ips_task is None and (self._ips is None or now - self._ips_at > 10.0):
+            self._ips_at = now
+            self._ips_task = self.run_task(self._fetch_ips)
+            if self._ips is None:
+                self._ips_task.wait(self.FIRST_IPS_WAIT)
         task = self._ips_task
         if task is not None and task.done:
             self._ips_task = None
             if task.error is None and task.result is not None:
                 self._ips = task.result
-        if self._ips is None:
-            self._ips, self._ips_at = self._fetch_ips(), now
-        elif now - self._ips_at > 10.0 and self._ips_task is None:
-            self._ips_at = now
-            if self.threaded:
-                self._ips_task = Task(self._fetch_ips)
-            else:
-                self._ips = self._fetch_ips()
-        return self._ips
+        return self._ips if self._ips is not None else []
+
+    @property
+    def ips_pending(self) -> bool:
+        """True while the first lookup of this computer's addresses has not answered yet."""
+        return self._ips is None and self._ips_task is not None
 
     def firewall_kind(self) -> Optional[str]:
         if self._firewall_kind is None:
@@ -586,7 +598,8 @@ class MenuContext:
                                 opponent_name=request.opponent_name, conn=request.conn,
                                 time_control=request.time_control, fen=request.fen,
                                 pgn_dir=options.pgn_dir, autosave=not options.no_save,
-                                flip=request.flip, unicode=self.theme.unicode)
+                                flip=request.flip, unicode=self.theme.unicode,
+                                board_size=self.settings.board_size)
 
     def game_finished(self, session: game.GameSession) -> List[Message]:
         """The messages the main menu shows after a game (also kept for printing at exit)."""
@@ -631,7 +644,8 @@ class Screen:
         return "Esc back"
 
     def info(self, s: Style) -> str:
-        return ip_summary(self.ctx.local_ips())
+        ips = self.ctx.local_ips()
+        return ip_summary(ips, self.ctx.ips_pending)
 
     def handle_key(self, key: str) -> Optional[Action]:
         return None
@@ -1197,6 +1211,8 @@ class WaitingScreen(ScrollingScreen):
             address_w = max(len(address) for _iface, address in ips)
             for iface, address in ips:
                 lines.append("    " + s.accent(address.ljust(address_w)) + ("   " + s.dim(iface) if iface else ""))
+        elif self.ctx.ips_pending:
+            lines.append(s.dim("Looking up this computer's IP address…"))
         else:
             lines.append(s.notice("Could not find this computer's IP address (see 'ip addr' or 'ipconfig')."))
         lines.append("")
@@ -1585,6 +1601,11 @@ class SettingsScreen(FormScreen):
                               help=f"The TCP port for hosting and joining (default {net.DEFAULT_PORT}).")
         self.pieces = ChoiceField("Pieces", (("unicode", "Chess symbols"), ("ascii", "Letters (N, Q, K)")),
                                   saved.piece_style, help="Letters work on any terminal and font.")
+        self.board = ChoiceField("Board size", BOARD_SIZE_CHOICES, saved.board_size,
+                                 help="How big the board and pieces are in a game. Auto: the biggest that fits "
+                                      "the window. Large and extra large draw big pieces (they need chess "
+                                      "symbols; a smaller size is used while the window is too small). "
+                                      "/size changes it during a game.")
         self.colors = ChoiceField("Colours", ON_OFF, saved.colors, help="Turn colours off for plain terminals.")
         self.flip = ChoiceField("Flip local board", ON_OFF, saved.flip_local,
                                 help="In local games, turn the board to the side to move.")
@@ -1594,8 +1615,8 @@ class SettingsScreen(FormScreen):
                                 help="Where finished games are saved (empty: ~/lanchess_games).")
         self.save_button = Button("Save", self.save, help=f"Saved in {_short_path(ctx.config_file())}.")
         self.cancel_button = Button("Cancel", self.cancel, help="Leave without saving.")
-        self.fields = [self.name, self.time, self.custom, self.color, self.port, self.pieces, self.colors,
-                       self.flip, self.autosave, self.folder, self.save_button, self.cancel_button]
+        self.fields = [self.name, self.time, self.custom, self.color, self.port, self.pieces, self.board,
+                       self.colors, self.flip, self.autosave, self.folder, self.save_button, self.cancel_button]
 
     def collect(self) -> Optional[config.Settings]:
         """The edited settings, or None (with the bad field focused) if something is invalid."""
@@ -1614,6 +1635,7 @@ class SettingsScreen(FormScreen):
             name=net.sanitize_name(self.name.value, default=""),
             time_control=str(time_control) if time_control else "",
             host_color=self.color.value, port=port, piece_style=self.pieces.value,
+            board_size=self.board.value,
             colors=bool(self.colors.value), flip_local=bool(self.flip.value),
             autosave=bool(self.autosave.value), pgn_dir=self.folder.value.strip(),
             recent_hosts=list(saved.recent_hosts))
@@ -2022,7 +2044,8 @@ class PlainMenu:
         self.say("", f"LAN Chess {__version__} — {TAGLINE}", "")
         for number, (_key, label, _desc) in enumerate(items, 1):
             self.say(f"  {number}) {label}")
-        self.say("", ip_summary(self.ctx.local_ips()))
+        ips = self.ctx.local_ips()
+        self.say("", ip_summary(ips, self.ctx.ips_pending))
         answer = self.ask(f"Choose 1-{len(items)}: ")
         if answer is None:
             return False
