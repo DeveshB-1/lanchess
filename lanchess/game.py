@@ -253,7 +253,7 @@ class GameSession:
                  opponent_name: str = "Opponent", conn: Any = None, time_control: Any = None,
                  fen: Optional[str] = STARTING_FEN, now_fn: Callable[[], float] = time.monotonic,
                  pgn_dir: Optional[str] = None, autosave: bool = True, flip: bool = True,
-                 unicode: bool = True) -> None:
+                 unicode: bool = True, board_size: str = "auto") -> None:
         if mode not in ("network", "local"):
             raise ValueError(f"mode must be 'network' or 'local', not {mode!r}")
         if mode == "network" and my_color not in (WHITE, BLACK):
@@ -275,6 +275,9 @@ class GameSession:
         self.autosave = autosave
         self.auto_flip = bool(flip) and self.local
         self.unicode = unicode
+        self.board_size = ui.normalize_board_size(board_size)  # auto, small, medium, large or xl (/size)
+        self.screen_size: Optional[Tuple[int, int]] = None  # the full-screen view's size and theme (set_screen)
+        self.screen_theme: Optional[ui.Theme] = None
         self.quit_requested = False
         self.log: List[Tuple[str, str]] = []
         self.log_total = 0
@@ -368,7 +371,7 @@ class GameSession:
                               + timing)
         self._log("info", "Type a move like e4, Nf3, exd5, O-O or e2e4 and press Enter.")
         if self.local:
-            self._log("info", "/takeback undoes a move, /draw ends in a draw, /resign resigns for the side "
+            self._log("info", "/undo takes back a move, /draw ends in a draw, /resign resigns for the side "
                               "to move. /help lists all commands.")
         else:
             self._log("info", "Chat with /c <message>. /help lists all commands.")
@@ -640,6 +643,74 @@ class GameSession:
         base = (WHITE if self.local else self.my_color) or WHITE
         self.flipped = target != base
         self.dirty = True
+
+    def _cmd_size(self, arg: str) -> None:
+        """/size [auto|small|medium|large|xl] (a unique prefix will do); no argument: the next size.
+
+        Only this session changes: the saved default is set in the menu's Settings.
+        """
+        word = arg.strip().lower()
+        if not word:
+            size = ui.next_board_size(self.board_size)
+        else:
+            matches = [name for name in ui.BOARD_SIZES if name.startswith(word)]
+            if len(matches) != 1:
+                self._error(f"Unknown board size: {_one_line(arg, 20)}. "
+                            "Use /size auto, small, medium, large or xl (or just /size for the next one).")
+                return
+            size = matches[0]
+        self.board_size = size
+        self.dirty = True
+        self._log("system", self._size_message(size))
+
+    def _size_message(self, size: str) -> str:
+        """What /size says: the chosen size and, when this window or theme cannot show it, what is
+        shown instead and what window it needs (``set_screen`` tells the session the window)."""
+        theme, screen = self.screen_theme, self.screen_size
+        if size == "auto":
+            hint = self._drawn_pieces_hint()
+            return "Board size: auto (the biggest board that fits the window)." + (" " + hint if hint else "")
+        if size == "small":
+            return "Board size: small."
+        if size in ("large", "xl") and not self.unicode:
+            return f"Board size: {size}. Drawn pieces need chess symbols, so the letter board is shown."
+        if theme is not None and not theme.color and size in ("medium", "large"):
+            needed = ui.min_window("xl", theme)
+            where = f" (in a window of at least {needed[0]}x{needed[1]})" if needed else ""
+            return (f"Board size: {size}. Without colours there is only the small board and, with /size xl, "
+                    f"a black-and-white diagram{where}, so the small board is shown.")
+        drawn = ", with drawn pieces" if size != "medium" else ""
+        if theme is None or screen is None:
+            return f"Board size: {size}{drawn} (smaller while the window is too small for it)."
+        shown = ui.board_tier(screen[0], screen[1], theme, size)
+        needed = ui.min_window(size, theme)
+        if shown == size or needed is None:
+            return f"Board size: {size}{drawn}."
+        return (f"Board size: {size}, but it needs a window of at least {needed[0]}x{needed[1]} (this one is "
+                f"{screen[0]}x{screen[1]}): {shown} is shown until you make the window bigger or the font smaller.")
+
+    def _drawn_pieces_hint(self) -> str:
+        """A hint that the window is too small for drawn pieces, or '' (when they show, when the
+        player chose a smaller size, or when this theme has none)."""
+        theme, screen = self.screen_theme, self.screen_size
+        if theme is None or screen is None or not self.unicode or self.board_size not in ("auto", "large", "xl"):
+            return ""
+        needed = ui.drawn_pieces_window(theme)
+        scale, _layout = ui.board_layout(screen[0], screen[1], theme, self.board_size)
+        if needed is None or ui.BOARD_LEVELS[scale - 1].sprite:
+            return ""
+        return (f"Drawn pieces need a window of at least {needed[0]}x{needed[1]} (this one is "
+                f"{screen[0]}x{screen[1]}): make the window bigger or the font smaller.")
+
+    def set_screen(self, size: Tuple[int, int], theme: ui.Theme) -> None:
+        """Note the full-screen view's size and theme (used by /size and the log scrolling). The
+        first time, say what window drawn pieces need if this one is too small for them."""
+        first = self.screen_size is None
+        self.screen_size, self.screen_theme = (int(size[0]), int(size[1])), theme
+        if first:
+            hint = self._drawn_pieces_hint()
+            if hint:
+                self._log("info", hint)
 
     def _cmd_moves(self, arg: str) -> None:
         if self.over is not None:
@@ -1060,15 +1131,24 @@ class GameSession:
         board = self.board
         check = board.is_check()
         if self.local:
-            return f"{color_name(board.turn)} to move" + (" — check!" if check else "")
+            return f"{color_name(board.turn)} to move" + (" — check!" if check else "") + self._undo_hint()
+        if "takeback" in self.outgoing:
+            return f"Waiting for {self.opponent_name} to answer your takeback request…"
         if board.turn == self.my_color:
-            if "takeback" in self.outgoing:
-                return f"Waiting for {self.opponent_name} to answer your takeback request…"
             text = "Your move" + (" — you are in check!" if check else "")
             if self.clock is not None and self.clock.running is None:
                 text += " (the clocks start after the first move)"
-            return text
-        return f"Waiting for {self.opponent_name} to move…"
+            return text + self._undo_hint()
+        return f"Waiting for {self.opponent_name} to move…" + self._undo_hint()
+
+    def _undo_hint(self) -> str:
+        """" · Ctrl+Z undo" in the full-screen view (where Ctrl+Z is a key) once a move can be undone."""
+        if self.screen_theme is None or not self.board.move_stack:
+            return ""
+        if not self.local and (not self.connected or "takeback" in self.incoming
+                               or len(self.board.move_stack) < self._takeback_plies(self.my_color)):
+            return ""
+        return (" · " if self.unicode else " - ") + "Ctrl+Z undo"
 
     def pending_text(self) -> str:
         parts = []
@@ -1113,6 +1193,7 @@ class GameSession:
             connection=self._t(self.connection_text()),
             pending=self._t(self.pending_text()),
             log_scroll=self.log_scroll,
+            board_size=self.board_size,
         )
 
     def display_key(self) -> Tuple[Any, ...]:
@@ -1147,6 +1228,7 @@ _COMMANDS: Dict[str, Callable[[GameSession, str], None]] = {
     "accept": GameSession._cmd_accept, "decline": GameSession._cmd_decline,
     "takeback": GameSession._cmd_takeback, "undo": GameSession._cmd_takeback,
     "flip": GameSession._cmd_flip,
+    "size": GameSession._cmd_size,
     "moves": GameSession._cmd_moves,
     "fen": GameSession._cmd_fen,
     "pgn": GameSession._cmd_pgn,
@@ -1256,15 +1338,6 @@ def _live_terminal_size() -> Tuple[int, int]:
     return term.terminal_size()
 
 
-def _log_line_count(log: List[Tuple[str, str]], width: int) -> int:
-    width = max(1, width)
-    total = 0
-    for entry in log:
-        for segment in str(entry[1]).split("\n"):
-            total += max(1, -(-len(segment) // width))
-    return total
-
-
 def run_interactive(session: GameSession, conn: Any = None, theme: Optional[ui.Theme] = None,
                     plain: bool = False, *, key_reader: Any = None, screen: Any = None,
                     input_source: Any = None, output: Optional[TextIO] = None,
@@ -1312,6 +1385,7 @@ def _run_fullscreen(session: GameSession, conn: Any, theme: ui.Theme, key_reader
         force = True
         while not session.quit_requested:
             size = size_fn()
+            session.set_screen(size, theme)
             changed = False
             event = editor.poll(poll_interval)
             handled = 0
@@ -1353,14 +1427,18 @@ def _editor_event(session: GameSession, event: tuple, reader: Any, size: Tuple[i
         session.handle_input(event[1])
     elif kind == "interrupt":
         session.request_quit()
+    elif kind == "undo":
+        session.log_scroll = 0
+        session.handle_input("/undo")
     elif kind == "eof":
         if getattr(reader, "eof", False):
             session.leave()
         else:
             session.request_quit()
     elif kind == "scroll":
-        page = max(1, size[1] // 2)
-        limit = _log_line_count(session.log, size[0])
+        # The log may sit in the side panel (beside drawn pieces) or below the board: page through
+        # it at the width and height it really has, so the oldest line can be reached and no line skipped.
+        limit, page = ui.log_scroll_limit(session.view_state(), size[0], size[1], session.screen_theme)
         session.log_scroll = max(0, min(limit, session.log_scroll - int(event[1]) * page))
     return True
 

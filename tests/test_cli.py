@@ -234,6 +234,39 @@ class FriendlyErrorTests(unittest.TestCase):
         message, _ = cli.server_error(OSError(errno.EACCES, "Permission denied"), 80)
         self.assertIn("not allowed", message)
 
+    def test_error_numbers_of_every_platform(self) -> None:
+        def windows_error(winerror: int, errno_value: int, text: str) -> OSError:
+            exc = OSError(errno_value, text)  # (what a Winsock failure looks like on Windows)
+            exc.winerror = winerror  # type: ignore[attr-defined]
+            return exc
+
+        in_use = [OSError(errno.EADDRINUSE, "Address already in use"),
+                  windows_error(10048, 10048, "Only one usage of each socket address is normally permitted"),
+                  windows_error(10048, errno.EINVAL, "Only one usage of each socket address")]
+        for exc in in_use:
+            with self.subTest(exc=exc):
+                self.assertEqual(cli.server_error(exc, 5555)[0], "port 5555 is already in use "
+                                 "(another LAN Chess game or another program is using it).")
+        denied = [OSError(errno.EACCES, "Permission denied"), OSError(errno.EPERM, "Operation not permitted"),
+                  PermissionError(errno.EACCES, "Permission denied"),
+                  windows_error(10013, errno.EACCES, "An attempt was made to access a socket in a way forbidden"),
+                  windows_error(10013, 10013, "An attempt was made to access a socket in a way forbidden")]
+        for exc in denied:
+            with self.subTest(exc=exc):
+                self.assertEqual(cli.server_error(exc, 5555)[0], "not allowed to use port 5555.")
+        for exc in (OSError(errno.ENETUNREACH, "Network is unreachable"), OSError(errno.EHOSTUNREACH, "No route"),
+                    windows_error(10065, 10065, "A socket operation was attempted to an unreachable host"),
+                    windows_error(10051, 10051, "A socket operation was attempted to an unreachable network")):
+            with self.subTest(exc=exc):
+                self.assertEqual(cli.connect_error(exc, "10.0.0.5", 5555)[0], "10.0.0.5:5555 is unreachable.")
+        for exc in (OSError(errno.ETIMEDOUT, "Connection timed out"),
+                    windows_error(10060, 10060, "A connection attempt failed (no response)")):
+            with self.subTest(exc=exc):
+                self.assertEqual(cli.connect_error(exc, "10.0.0.5", 5555)[0], "timed out connecting to 10.0.0.5:5555.")
+        other = windows_error(10022, errno.EINVAL, "An invalid argument was supplied")
+        self.assertEqual(cli.server_error(other, 5555),
+                         ("could not listen on port 5555: An invalid argument was supplied", []))
+
     def test_port_advice_fits_where_the_port_is_chosen(self) -> None:
         in_use, denied = OSError(errno.EADDRINUSE, "Address already in use"), OSError(errno.EACCES, "Permission denied")
         self.assertEqual(cli.server_error(in_use, 5555)[1],

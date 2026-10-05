@@ -7,7 +7,7 @@ import os
 import sys
 import time
 import unittest
-from typing import List, Optional
+from typing import Any, List, Optional
 from unittest import mock
 
 from lanchess import term
@@ -133,7 +133,7 @@ class KeyParserCharacterTest(unittest.TestCase):
             self.assertEqual(KeyParser().feed(char), [key], repr(char))
 
     def test_unmapped_control_characters_are_ignored(self) -> None:
-        self.assertEqual(KeyParser().feed("\x00\x1a\x1c\x1f\x85a"), ["a"])
+        self.assertEqual(KeyParser().feed("\x00\x1c\x1f\x85a"), ["a"])
 
     def test_printable_unicode_passes_through(self) -> None:
         self.assertEqual(KeyParser().feed("é♞日 "), ["é", "♞", "日", " "])
@@ -215,6 +215,16 @@ class KeyReaderPtyTest(unittest.TestCase):
             except OSError:
                 pass
 
+    @staticmethod
+    def settable(attrs: List[Any]) -> List[Any]:
+        """termios attributes without the local-mode bits that the kernel itself manages: macOS and
+        the BSDs set PENDIN when a terminal goes back to canonical mode (to retype pending input)."""
+        termios = term.termios
+        kernel_bits = getattr(termios, "PENDIN", 0) | getattr(termios, "FLUSHO", 0)
+        attrs = list(attrs)
+        attrs[3] &= ~kernel_bits
+        return attrs
+
     def test_reads_keys_in_raw_mode_and_restores(self) -> None:
         termios = term.termios
         before = termios.tcgetattr(self.slave)
@@ -231,7 +241,22 @@ class KeyReaderPtyTest(unittest.TestCase):
             started = time.monotonic()
             self.assertEqual(reader.read_key(1.0), "ESC")
             self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(termios.tcgetattr(self.slave), before)
+        after = termios.tcgetattr(self.slave)
+        modes = termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN
+        self.assertEqual(after[3] & modes, before[3] & modes)  # (the flags raw mode turned off)
+        self.assertEqual(self.settable(after), self.settable(before))
+
+    def test_kernel_managed_bits_are_ignored_but_nothing_else(self) -> None:
+        termios = term.termios
+        attrs = termios.tcgetattr(self.slave)
+        pendin = getattr(termios, "PENDIN", 0)
+        if pendin:
+            changed = list(attrs)
+            changed[3] |= pendin
+            self.assertEqual(self.settable(changed), self.settable(attrs))
+        changed = list(attrs)
+        changed[3] ^= termios.ECHO
+        self.assertNotEqual(self.settable(changed), self.settable(attrs))
 
     def test_pasted_crlf_is_one_enter(self) -> None:
         with KeyReader(fd=self.slave) as reader:

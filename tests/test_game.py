@@ -18,6 +18,11 @@ from lanchess.engine import BLACK, STARTING_FEN, WHITE, Outcome
 from lanchess.game import NOT_A_MOVE, ChessClock, GameSession, TimeControl, parse_time_control
 from lanchess.net import ConnectionClosed
 
+try:
+    from .support import watch_threads
+except ImportError:  # (the tests folder itself is on sys.path: unittest discover -s tests)
+    from support import watch_threads
+
 FOOLS_MATE = ("f3", "e5", "g4", "Qh4#")
 WAIT = 5.0
 
@@ -921,7 +926,7 @@ class CommandTests(SessionTestCase):
 
     def test_save_failure_is_reported(self) -> None:
         blocker = os.path.join(self.tmp, "file")
-        with open(blocker, "w") as handle:
+        with open(blocker, "w", encoding="utf-8") as handle:
             handle.write("x")
         s = self.local(pgn_dir=os.path.join(blocker, "sub"))
         s.handle_input("/save")
@@ -936,16 +941,7 @@ class LoopbackTests(SessionTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.addCleanup(self.assert_no_leaked_threads)
-
-    def assert_no_leaked_threads(self) -> None:
-        deadline = time.monotonic() + WAIT
-        while True:
-            leftovers = [t.name for t in threading.enumerate() if t.name.startswith("lanchess-") and t.name != "lanchess-stdin"]
-            if not leftovers or time.monotonic() > deadline:
-                break
-            time.sleep(0.02)
-        self.assertEqual(leftovers, [])
+        watch_threads(self, WAIT)
 
     def connect_pair(self, tc: Optional[TimeControl] = None) -> Tuple[GameSession, GameSession]:
         server = net.Server(port=0, bind="127.0.0.1")

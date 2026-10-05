@@ -7,6 +7,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import sprites
+
 WHITE = "w"
 BLACK = "b"
 
@@ -39,14 +41,59 @@ STATUS_BG = 236
 STATUS_FG = 252
 GAME_OVER_FG = 222
 
+# Sprite pieces (the large and xl board sizes): every pixel is the square colour, the fill or the
+# outline/detail colour. White is a white fill with a near-black outline; Black a black fill with a
+# light grey outline, so both stand out on light, dark, last-move and check squares alike.
+SPRITE_WHITE_FILL = 231
+SPRITE_WHITE_LINE = 234
+SPRITE_BLACK_FILL = 16
+SPRITE_BLACK_LINE = 248
+MONO_MIN_SPRITE = 14  # without colour only the outlined sprites (14 and 16 pixels) are used
+
 LOW_TIME_MS = 20000
 WIDE_MIN_WIDTH = 70
 PANEL_GAP = 2
 PANEL_MAX_WIDTH = 44
 LARGE_PANEL_MIN_WIDTH = 32
+SPRITE_PANEL_MIN_WIDTH = 30
+SPRITE_PANEL_MAX_WIDTH = 60
 MIN_LOG_ROWS = 3
+MIN_PANEL_MOVE_ROWS = 4  # beside a drawn board the move list keeps at least this many rows
+LOG_BELOW_MIN_ROWS = 8  # sprite boards show the log below the board when this many rows are free there
 SAN_WIDTH = 7
-SQUARE_SIZES = ((3, 1), (5, 2), (7, 3))
+FOOTER_ROWS = 3  # offer line, status bar and prompt: kept free so the board never jumps when an offer comes
+
+# The board sizes a player can choose ("auto" picks the biggest that fits the window).
+BOARD_SIZES = ("auto", "small", "medium", "large", "xl")
+_TIER_RANK = {"small": 1, "medium": 2, "large": 3, "xl": 4}
+
+
+@dataclass(frozen=True)
+class BoardLevel:
+    """One board geometry: its size tier, the square size in columns x rows and the sprite size.
+
+    ``sprite`` is 0 for text squares (one glyph per square); otherwise the pieces are drawn as
+    ``sprite`` x ``sprite`` pixel block art, two pixels per cell (so ``sq_w == sprite`` and
+    ``sq_h == sprite // 2``: terminal cells are about twice as tall as wide, so pixels are square).
+    """
+
+    tier: str
+    sq_w: int
+    sq_h: int
+    sprite: int = 0
+
+
+# Smallest first; ``render_board``'s ``scale`` is a 1-based index into this table.
+BOARD_LEVELS = (
+    BoardLevel("small", 3, 1),
+    BoardLevel("medium", 5, 2),
+    BoardLevel("medium", 7, 3),
+    BoardLevel("large", 8, 4, 8),
+    BoardLevel("large", 10, 5, 10),
+    BoardLevel("xl", 12, 6, 12),
+    BoardLevel("xl", 14, 7, 14),
+    BoardLevel("xl", 16, 8, 16),
+)
 
 _SOLID_GLYPHS = {"k": "♚", "q": "♛", "r": "♜", "b": "♝", "n": "♞", "p": "♟"}
 _OUTLINE_GLYPHS = {"k": "♔", "q": "♕", "r": "♖", "b": "♗", "n": "♘", "p": "♙"}
@@ -246,6 +293,117 @@ def _square_text(content: str, width: int) -> str:
     return " " * left + content + " " * (width - 1 - left)
 
 
+def normalize_board_size(value: Any) -> str:
+    """A board size name from BOARD_SIZES (case and spaces ignored); anything else means "auto"."""
+    if isinstance(value, str) and value.strip().lower() in BOARD_SIZES:
+        return value.strip().lower()
+    return "auto"
+
+
+def next_board_size(current: Any) -> str:
+    """The board size after ``current`` in BOARD_SIZES order (after "xl" comes "auto" again)."""
+    index = BOARD_SIZES.index(normalize_board_size(current))
+    return BOARD_SIZES[(index + 1) % len(BOARD_SIZES)]
+
+
+def _allowed_levels(theme: Theme, board_size: str = "auto") -> List[int]:
+    """The 1-based BOARD_LEVELS a theme can draw, up to the tier of ``board_size`` (smallest first).
+
+    Sprites need Unicode block characters, so --ascii keeps to the letter boards. Without colour
+    the bigger text squares and the silhouette sprites would not show the squares or the sides,
+    so there are only the compact board and the outlined sprites (drawn in black and white like a
+    printed diagram, see ``_mono_square``).
+    """
+    size = normalize_board_size(board_size)
+    cap = _TIER_RANK.get(size, len(_TIER_RANK))
+    levels = []
+    for index, level in enumerate(BOARD_LEVELS, 1):
+        if _TIER_RANK[level.tier] > cap:
+            continue
+        if level.sprite and not theme.unicode:
+            continue
+        if not theme.color and (index > 1 and level.sprite < MONO_MIN_SPRITE):
+            continue
+        levels.append(index)
+    return levels
+
+
+def _board_dims(scale: int) -> Tuple[int, int]:
+    """Columns and rows of the board at a level, including the rank labels and the file-label row."""
+    level = BOARD_LEVELS[scale - 1]
+    return 3 + 8 * level.sq_w, 8 * level.sq_h + 1
+
+
+def board_layout(width: int, height: int, theme: Optional[Theme] = None, board_size: str = "auto") -> Tuple[int, str]:
+    """The board level (1-based index into BOARD_LEVELS) and layout for a ``width`` x ``height`` frame.
+
+    The biggest level the theme allows (capped at the tier of ``board_size``; "auto" allows all)
+    whose board fits is used, so the pieces grow and shrink with the window. Layouts:
+
+    * ``wide``: the board with the side panel to its right (players, clocks, captures, moves; for
+      sprite boards also the message log, so the board can use nearly the whole height);
+    * ``stacked``: the panel below the board (narrow windows, or tall windows too narrow for a
+      big board plus a side panel).
+
+    Three rows stay free for the offer line, status bar and prompt; text boards also keep a
+    small log below the board. A board that would not fit is never chosen, except the compact
+    board when nothing fits at all.
+    """
+    theme = theme or Theme()
+    width, height = max(1, int(width)), max(1, int(height))
+    rows = height - FOOTER_ROWS
+    allowed = _allowed_levels(theme, board_size)
+    wide_ok = width >= WIDE_MIN_WIDTH
+    for scale in reversed(allowed):
+        board_w, board_h = _board_dims(scale)
+        if wide_ok:
+            if BOARD_LEVELS[scale - 1].sprite:
+                if board_w + PANEL_GAP + SPRITE_PANEL_MIN_WIDTH <= width and board_h <= rows:
+                    return scale, "wide"
+            elif board_w + PANEL_GAP + LARGE_PANEL_MIN_WIDTH <= width and board_h + 1 + MIN_LOG_ROWS <= rows:
+                return scale, "wide"
+        if board_w <= width and board_h + 3 + 1 + MIN_LOG_ROWS <= rows:
+            return scale, "stacked"
+    return allowed[0], "wide" if wide_ok else "stacked"
+
+
+def board_tier(width: int, height: int, theme: Optional[Theme] = None, board_size: str = "auto") -> str:
+    """The size tier (small, medium, large or xl) actually shown for a frame of this size."""
+    return BOARD_LEVELS[board_layout(width, height, theme, board_size)[0] - 1].tier
+
+
+def min_window(tier: str, theme: Optional[Theme] = None) -> Optional[Tuple[int, int]]:
+    """The smallest window (columns, rows) that shows a ``tier`` board with the side panel, or
+    None if the theme has no board of that tier (no drawn pieces with letters; without colours
+    only the small board and the xl diagram). The small board shows in any window."""
+    theme = theme or Theme()
+    if tier == "small":
+        return 1, 1
+    levels = [scale for scale in _allowed_levels(theme, tier) if BOARD_LEVELS[scale - 1].tier == tier]
+    if not levels:
+        return None
+    board_w, board_h = _board_dims(levels[0])
+    if BOARD_LEVELS[levels[0] - 1].sprite:
+        return max(WIDE_MIN_WIDTH, board_w + PANEL_GAP + SPRITE_PANEL_MIN_WIDTH), board_h + FOOTER_ROWS
+    return max(WIDE_MIN_WIDTH, board_w + PANEL_GAP + LARGE_PANEL_MIN_WIDTH), board_h + 1 + MIN_LOG_ROWS + FOOTER_ROWS
+
+
+def drawn_pieces_window(theme: Optional[Theme] = None) -> Optional[Tuple[int, int]]:
+    """The smallest window (columns, rows) with drawn pieces for this theme (None: it has none)."""
+    theme = theme or Theme()
+    return min_window("large", theme) or min_window("xl", theme)
+
+
+def _usable_level(scale: Any, theme: Theme) -> int:
+    """The biggest level the theme can draw that is not bigger than ``scale``."""
+    try:
+        wanted = int(scale)
+    except (TypeError, ValueError):
+        wanted = 1
+    wanted = max(1, min(wanted, len(BOARD_LEVELS)))
+    return max(level for level in _allowed_levels(theme) if level <= wanted)
+
+
 def render_board(
     board: Any,
     perspective: str = WHITE,
@@ -255,13 +413,14 @@ def render_board(
 ) -> List[str]:
     """Board lines: 8 ranks with labels on the left, file labels below, flipped for Black.
 
-    ``last_move`` defaults to ``board.last_move()``. ``scale`` picks the square size from SQUARE_SIZES
-    (1: 3x1, 2: 5x2, 3: 7x3 columns x rows); without colour it is always 1. All lines have equal width.
+    ``last_move`` defaults to ``board.last_move()``. ``scale`` is a 1-based index into BOARD_LEVELS
+    (1: 3x1, 2: 5x2, 3: 7x3 text squares; 4-8: sprite pieces on 8x4 up to 16x8 squares), lowered
+    to the biggest level the theme can draw (``_allowed_levels``). All lines have equal width.
     """
     theme = theme or Theme()
-    scale = max(1, int(scale)) if theme.color else 1
-    scale = min(scale, len(SQUARE_SIZES))
-    sq_w, sq_h = SQUARE_SIZES[scale - 1]
+    scale = _usable_level(scale, theme)
+    level = BOARD_LEVELS[scale - 1]
+    sq_w, sq_h = level.sq_w, level.sq_h
     mid = sq_h // 2
     flipped = perspective == BLACK
     files = list(range(7, -1, -1)) if flipped else list(range(8))
@@ -272,31 +431,41 @@ def render_board(
     check = _check_square(board)
     lines: List[str] = []
     for rank in ranks:
+        squares = []
+        for file in files:
+            sq = rank * 8 + file
+            piece = _piece_at(board, sq)
+            light = (rank + file) % 2 == 1
+            if level.sprite and theme.color:
+                squares.append(_sprite_square(piece, _square_bg(light, sq in marked, sq == check), scale))
+            elif level.sprite:
+                mark = "check" if sq == check else "last" if sq in marked else ""
+                squares.append(_mono_square(piece, light, mark, scale))
+            elif theme.color:
+                cells = [_color_square(piece if row == mid else None, light, sq in marked, sq == check, sq_w, theme)
+                         for row in range(sq_h)]
+                squares.append(cells)
+            else:
+                squares.append([_plain_square(piece, sq in marked, theme)])
         for row in range(sq_h):
             label = " " + theme.paint(str(rank + 1), fg=COORD_FG) + " " if row == mid else "   "
-            cells = [label]
-            for file in files:
-                sq = rank * 8 + file
-                piece = _piece_at(board, sq) if row == mid else None
-                if theme.color:
-                    cells.append(_color_square(piece, (rank + file) % 2 == 1, sq in marked, sq == check, sq_w, theme))
-                else:
-                    cells.append(_plain_square(_piece_at(board, sq), sq in marked, theme))
-            if theme.color:
-                cells.append(RESET)
-            lines.append("".join(cells))
+            line = label + "".join(cells[row] for cells in squares)
+            lines.append(line + RESET if theme.color else line)
     labels = "".join(_square_text("abcdefgh"[f], sq_w) for f in files)
     lines.append("   " + theme.paint(labels, fg=COORD_FG))
     return lines
 
 
-def _color_square(piece: Optional[str], light: bool, marked: bool, check: bool, width: int, theme: Theme) -> str:
+def _square_bg(light: bool, marked: bool, check: bool) -> int:
     if check:
-        bg = CHECK_SQUARE
-    elif marked:
-        bg = LIGHT_HIGHLIGHT if light else DARK_HIGHLIGHT
-    else:
-        bg = LIGHT_SQUARE if light else DARK_SQUARE
+        return CHECK_SQUARE
+    if marked:
+        return LIGHT_HIGHLIGHT if light else DARK_HIGHLIGHT
+    return LIGHT_SQUARE if light else DARK_SQUARE
+
+
+def _color_square(piece: Optional[str], light: bool, marked: bool, check: bool, width: int, theme: Theme) -> str:
+    bg = _square_bg(light, marked, check)
     if piece is None:
         return sgr(0, 48, 5, bg) + " " * width
     fg = WHITE_PIECE if piece.isupper() else BLACK_PIECE
@@ -307,6 +476,130 @@ def _color_square(piece: Optional[str], light: bool, marked: bool, check: bool, 
 def _plain_square(piece: Optional[str], marked: bool, theme: Theme) -> str:
     content = piece_glyph(piece, theme) if piece else "."
     return "[" + content + "]" if marked else " " + content + " "
+
+
+# Rendered square rows, keyed by (piece or None, square colour or mark, level): a board is at most
+# 13 pieces x 5 square colours per level, and a frame then only joins cached strings.
+_SQUARE_CACHE: Dict[Tuple[Any, ...], List[str]] = {}
+_UPPER_HALF = "▀"
+
+
+def _sprite_colors(piece: str) -> Tuple[Optional[int], int, int, int]:
+    """Colour per sprite pixel kind (EMPTY, FILL, LINE, DETAIL); None is the square colour."""
+    if piece.isupper():
+        return None, SPRITE_WHITE_FILL, SPRITE_WHITE_LINE, SPRITE_WHITE_LINE
+    return None, SPRITE_BLACK_FILL, SPRITE_BLACK_LINE, SPRITE_BLACK_LINE
+
+
+def _sprite_square(piece: Optional[str], bg: int, scale: int) -> List[str]:
+    """The rows of one square with a block-art piece: each cell is an upper half block whose
+    foreground is the top pixel and background the bottom pixel (a space where both match)."""
+    key = (piece, bg, scale)
+    cached = _SQUARE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    level = BOARD_LEVELS[scale - 1]
+    if piece is None or piece.upper() not in "KQRBNP":
+        rows = [sgr(0, 48, 5, bg) + " " * level.sq_w] * level.sq_h
+    else:
+        grid = sprites.pixels(level.sprite, piece)
+        palette = _sprite_colors(piece)
+        rows = []
+        for row in range(level.sq_h):
+            top_row, bottom_row = grid[2 * row], grid[2 * row + 1]
+            out: List[str] = []
+            codes: List[object] = [0]
+            fg: Optional[int] = None
+            cur_bg: Optional[int] = None
+            for col in range(level.sq_w):
+                top = palette[top_row[col]]
+                bottom = palette[bottom_row[col]]
+                top = bg if top is None else top
+                bottom = bg if bottom is None else bottom
+                if bottom != cur_bg:
+                    codes += [48, 5, bottom]
+                    cur_bg = bottom
+                if top != bottom and top != fg:
+                    codes += [38, 5, top]
+                    fg = top
+                if codes:
+                    out.append(sgr(*codes))
+                    codes = []
+                out.append(" " if top == bottom else _UPPER_HALF)
+            rows.append("".join(out))
+    _SQUARE_CACHE[key] = rows
+    return rows
+
+
+_MONO_CELLS = {(False, False): " ", (True, False): "▀", (False, True): "▄", (True, True): "█"}
+_MONO_SHADE = "░"
+_MONO_CORNERS = {"last": "┌┐└┘", "check": "╔╗╚╝"}
+
+
+def _on_silhouette_edge(grid: sprites.Grid, r: int, c: int) -> bool:
+    """Whether pixel (r, c) touches the outside of the piece (an empty pixel or the grid border,
+    diagonals included)."""
+    size = len(grid)
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            rr, cc = r + dr, c + dc
+            if not (0 <= rr < size and 0 <= cc < size) or grid[rr][cc] == sprites.EMPTY:
+                return True
+    return False
+
+
+def _mono_frame(mark: str, row: int, col: int, sq_w: int, sq_h: int) -> str:
+    """The mark character for an empty cell on the edge of a marked square ('' inside it).
+
+    The last move gets light corners; the king in check a double frame all around the square, so
+    the two are told apart at a glance."""
+    top, bottom, left, right = row == 0, row == sq_h - 1, col == 0, col == sq_w - 1
+    if mark == "last":
+        corners = _MONO_CORNERS["last"]
+        return corners[2 * bottom + right] if (top or bottom) and (left or right) else ""
+    if mark == "check":
+        if (top or bottom) and (left or right):
+            return _MONO_CORNERS["check"][2 * bottom + right]
+        return "═" if top or bottom else "║" if left or right else ""
+    return ""
+
+
+def _mono_square(piece: Optional[str], light: bool, mark: str, scale: int) -> List[str]:
+    """A sprite square without colour, drawn like a printed diagram: dark squares are shaded,
+    White pieces are outlines (the outline and detail pixels are ink, the fill is blank) and Black
+    pieces are solid ink with their detail and inner lines (outline pixels inside the silhouette,
+    such as a collar or the king's cross) left blank. Corner marks show the last move and a double
+    frame the king in check (see ``_mono_frame``)."""
+    key = (piece, light, mark, scale)
+    cached = _SQUARE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    level = BOARD_LEVELS[scale - 1]
+    size, sq_w, sq_h = level.sprite, level.sq_w, level.sq_h
+    ink = [[False] * size for _ in range(size)]
+    covered = [[False] * size for _ in range(size)]
+    if piece is not None and piece.upper() in "KQRBNP":
+        grid = sprites.pixels(size, piece)
+        for r, pixel_row in enumerate(grid):
+            for c, kind in enumerate(pixel_row):
+                covered[r][c] = kind != sprites.EMPTY
+                if piece.isupper():
+                    ink[r][c] = kind in (sprites.LINE, sprites.DETAIL)
+                else:
+                    edge = kind == sprites.LINE and _on_silhouette_edge(grid, r, c)
+                    ink[r][c] = kind == sprites.FILL or edge
+    rows = []
+    for row in range(sq_h):
+        out = []
+        for col in range(sq_w):
+            top, bottom = 2 * row, 2 * row + 1
+            if covered[top][col] or covered[bottom][col]:
+                out.append(_MONO_CELLS[ink[top][col], ink[bottom][col]])
+            else:
+                out.append(_mono_frame(mark, row, col, sq_w, sq_h) or (" " if light else _MONO_SHADE))
+        rows.append("".join(out))
+    _SQUARE_CACHE[key] = rows
+    return rows
 
 
 def _move_pairs(board: Any) -> List[Tuple[int, Optional[str], Optional[str]]]:
@@ -369,6 +662,7 @@ def help_lines() -> List[str]:
         "/resign         resign the game",
         "/rematch        offer a rematch after the game ends",
         "/flip           flip the board",
+        "/size [size]    board size: auto, small, medium, large, xl (alone: next)",
         "/moves          list the legal moves",
         "/fen            show the position as FEN",
         "/pgn            show the game as PGN",
@@ -376,7 +670,7 @@ def help_lines() -> List[str]:
         "/clear          clear the message log",
         "/quit           leave the game (also /exit, /q)",
         "/help           show this help (also ?)",
-        "Keys: Up/Down input history, PgUp/PgDn scroll messages, Ctrl-L redraw.",
+        "Keys: Ctrl+Z undo (/undo), Up/Down input history, PgUp/PgDn scroll messages, Ctrl-L redraw.",
     ]
 
 
@@ -398,6 +692,7 @@ class ViewState:
     connection: str = ""
     pending: str = ""
     log_scroll: int = 0
+    board_size: str = "auto"
 
 
 def _player_name(view: ViewState, color: str) -> str:
@@ -519,13 +814,33 @@ def _inline_moves(view: ViewState, width: int, rows: int, theme: Theme) -> List[
     return list(reversed(lines[:rows]))
 
 
-def _wide_panel(view: ViewState, width: int, rows: int, theme: Theme) -> List[str]:
-    """Right-hand panel aligned with the board ranks: top player, captures, moves, captures, bottom player."""
+def _panel_log_rows(view: ViewState, width: int, rows: int) -> int:
+    """How many of ``rows`` panel rows (shared by the move list and the log) the log gets.
+
+    Each side gets what it needs while there is room; when both need more, the log gets about
+    half, so a long game keeps its recent moves in sight and a chatty one its messages. The log
+    always keeps MIN_LOG_ROWS rows (and the moves MIN_PANEL_MOVE_ROWS)."""
+    moves_needed = max(1, len(_move_pairs(view.board)))
+    log_needed = log_line_count(view.log, width, rows)
+    log_rows = min(log_needed, max(rows - moves_needed, rows // 2))
+    return max(min(MIN_LOG_ROWS, rows - MIN_PANEL_MOVE_ROWS), min(log_rows, rows - MIN_PANEL_MOVE_ROWS))
+
+
+def _wide_panel(view: ViewState, width: int, rows: int, theme: Theme,
+                with_log: bool = False) -> Tuple[List[str], Optional[Tuple[int, int]]]:
+    """Right-hand panel aligned with the board ranks: top player, captures, moves, captures, bottom player.
+
+    ``with_log`` (sprite boards, which take nearly the whole height) also puts the message log in
+    the panel, below the moves, newest line at the bottom, if the panel is tall enough (see
+    ``_panel_log_rows`` for how the rows are shared). Returns the lines and, if the log is in
+    them, its (columns, rows).
+    """
     top = BLACK if view.perspective != BLACK else WHITE
     bottom = _opposite(top)
     lines = [""] * rows
+    log_box: Optional[Tuple[int, int]] = None
     if rows < 2:
-        return [_player_line(view, bottom, width, theme)][:rows]
+        return [_player_line(view, bottom, width, theme)][:rows], None
     lines[0] = _player_line(view, top, width, theme)
     lines[-1] = _player_line(view, bottom, width, theme)
     if rows >= 4:
@@ -536,39 +851,37 @@ def _wide_panel(view: ViewState, width: int, rows: int, theme: Theme) -> List[st
         rule = theme.paint(_symbols(theme).rule * width, fg=DIM_FG)
         lines[first], lines[last - 1] = rule, rule
         first, last = first + 1, last - 1
+        if with_log and last - first >= 12:
+            log_rows = _panel_log_rows(view, width, last - first - 1)
+            log = _log_lines(view, width, log_rows, theme)
+            lines[last - log_rows:last] = [""] * (log_rows - len(log)) + log
+            last -= log_rows + 1
+            lines[last] = rule
+            log_box = (width, log_rows)
     lines[first:last] = _move_rows(view, width, last - first, theme)
-    return [truncate(line, width) for line in lines]
+    return [truncate(line, width) for line in lines], log_box
 
 
-def _board_dims(scale: int) -> Tuple[int, int]:
-    sq_w, sq_h = SQUARE_SIZES[scale - 1]
-    return 3 + 8 * sq_w, 8 * sq_h + 1
+def _wide_top(view: ViewState, width: int, height: int, scale: int,
+              theme: Theme) -> Tuple[List[str], Optional[Tuple[int, int]]]:
+    """The board with the side panel; also the (columns, rows) of the message log if the panel holds it.
 
-
-def _choose_scale(width: int, rows: int, theme: Theme, side_width: int, extra_rows: int) -> int:
-    """Largest board scale leaving ``side_width`` columns and ``extra_rows`` rows (plus a minimal log) free."""
-    if not theme.color:
-        return 1
-    for scale in range(len(SQUARE_SIZES), 1, -1):
-        board_w, board_h = _board_dims(scale)
-        if board_w + side_width <= width and board_h + extra_rows + 1 + MIN_LOG_ROWS <= rows:
-            return scale
-    return 1
-
-
-def _wide_top(view: ViewState, width: int, rows: int, theme: Theme) -> List[str]:
-    scale = _choose_scale(width, rows, theme, PANEL_GAP + LARGE_PANEL_MIN_WIDTH, 0)
+    Sprite boards take nearly the whole height, so their log goes into the panel unless the
+    window leaves at least LOG_BELOW_MIN_ROWS rows below the board anyway.
+    """
     board_lines = render_board(view.board, view.perspective, None, theme, scale)
     board_w = visible_len(board_lines[0])
-    panel_w = min(PANEL_MAX_WIDTH, width - board_w - PANEL_GAP)
-    panel = _wide_panel(view, panel_w, len(board_lines) - 1, theme)
+    below = height - FOOTER_ROWS - len(board_lines)
+    with_log = bool(BOARD_LEVELS[scale - 1].sprite) and below < LOG_BELOW_MIN_ROWS
+    panel_w = min(SPRITE_PANEL_MAX_WIDTH if with_log else PANEL_MAX_WIDTH, width - board_w - PANEL_GAP)
+    panel, log_box = _wide_panel(view, panel_w, len(board_lines) - 1, theme, with_log)
     gap = " " * PANEL_GAP
-    return [line + gap + panel[i] if i < len(panel) and panel[i] else line for i, line in enumerate(board_lines)]
+    lines = [line + gap + panel[i] if i < len(panel) and panel[i] else line for i, line in enumerate(board_lines)]
+    return lines, log_box
 
 
-def _narrow_top(view: ViewState, width: int, rows: int, room: int, theme: Theme) -> List[str]:
+def _narrow_top(view: ViewState, width: int, room: int, scale: int, theme: Theme) -> List[str]:
     """Board with the panel stacked below it: both players (with captures), then recent moves."""
-    scale = _choose_scale(width, rows, theme, 0, 3)
     lines = render_board(view.board, view.perspective, None, theme, scale)
     board_w = visible_len(lines[0])
     panel_w = min(width, max(board_w, 40))
@@ -612,6 +925,23 @@ def _wrap(text: str, width: int) -> List[str]:
     return [line if i == 0 else indent + line for i, line in enumerate(lines)]
 
 
+def _log_entry(entry: Any) -> Tuple[str, List[str]]:
+    """A log entry's kind and its text lines (made safe to print, not yet wrapped)."""
+    kind, text = (entry[0], entry[1]) if len(entry) >= 2 else ("info", entry[0] if entry else "")
+    return str(kind), [_clean(segment) for segment in str(text).replace("\r\n", "\n").split("\n")]
+
+
+def log_line_count(log: Any, width: int, cap: Optional[int] = None) -> int:
+    """How many display lines the log takes when wrapped to ``width`` columns (as ``_log_lines``
+    wraps it); counting stops early once ``cap`` lines are reached."""
+    total = 0
+    for entry in reversed(list(log)):
+        total += sum(len(_wrap(segment, width)) for segment in _log_entry(entry)[1])
+        if cap is not None and total >= cap:
+            return cap
+    return total
+
+
 def _log_lines(view: ViewState, width: int, rows: int, theme: Theme) -> List[str]:
     """The log as wrapped, styled display lines: the most recent ``rows`` lines, scrolled back by ``log_scroll``."""
     if rows <= 0:
@@ -621,13 +951,10 @@ def _log_lines(view: ViewState, width: int, rows: int, theme: Theme) -> List[str
     collected: List[str] = []
     entries = list(view.log)
     for entry in reversed(entries):
-        kind, text = (entry[0], entry[1]) if len(entry) >= 2 else ("info", entry[0] if entry else "")
-        style = _LOG_STYLES.get(str(kind), {})
-        wrapped = [
-            theme.paint(line, **style) if line else line
-            for segment in str(text).replace("\r\n", "\n").split("\n")
-            for line in _wrap(_clean(segment), width)
-        ]
+        kind, segments = _log_entry(entry)
+        style = _LOG_STYLES.get(kind, {})
+        wrapped = [theme.paint(line, **style) if line else line
+                   for segment in segments for line in _wrap(segment, width)]
         collected[:0] = wrapped
         if len(collected) >= needed:
             break
@@ -718,8 +1045,33 @@ def _prompt_line(view: ViewState, width: int, theme: Theme) -> Tuple[str, int]:
 
 
 def render_screen(view: ViewState, width: int, height: int, theme: Optional[Theme] = None) -> Tuple[str, Tuple[int, int]]:
-    """Compose the full frame (exactly ``height`` lines, each at most ``width`` columns) and the caret position."""
-    theme = theme or Theme()
+    """Compose the full frame (exactly ``height`` lines, each at most ``width`` columns) and the caret position.
+
+    The board size follows ``view.board_size`` and the frame size (see ``board_layout``), so it is
+    recomputed on every call and a resized window gets bigger or smaller pieces at once.
+    """
+    lines, caret, _log_box = _compose(view, width, height, theme or Theme())
+    return "\n".join(lines), caret
+
+
+def log_geometry(view: ViewState, width: int, height: int, theme: Optional[Theme] = None) -> Tuple[int, int]:
+    """The (columns, rows) the message log gets in a ``width`` x ``height`` frame of this view: in
+    the side panel beside a drawn board, otherwise below the board (as ``render_screen`` lays it out)."""
+    return _compose(view, width, height, theme or Theme())[2]
+
+
+def log_scroll_limit(view: ViewState, width: int, height: int, theme: Optional[Theme] = None) -> Tuple[int, int]:
+    """The biggest useful ``log_scroll`` (the oldest log line is then in sight) and a page size for
+    PgUp/PgDn (a little less than the visible log rows, so no line is skipped), for this frame."""
+    columns, rows = log_geometry(view, width, height, theme)
+    if rows <= 0:
+        return 0, 1
+    return max(0, log_line_count(view.log, columns) - rows), max(1, rows - 2)
+
+
+def _compose(view: ViewState, width: int, height: int,
+             theme: Theme) -> Tuple[List[str], Tuple[int, int], Tuple[int, int]]:
+    """The frame lines, the caret position and the log's (columns, rows)."""
     width, height = max(1, int(width)), max(1, int(height))
     prompt, caret_col = _prompt_line(view, width, theme)
     footer = [_status_line(view, width, theme)]
@@ -727,15 +1079,19 @@ def render_screen(view: ViewState, width: int, height: int, theme: Optional[Them
         footer.insert(0, _pending_line(view, width, theme))
     footer = footer[max(0, len(footer) - (height - 1)):]
     room = height - 1 - len(footer)
-    stable_rows = height - 3
-    if width >= WIDE_MIN_WIDTH:
-        top = _wide_top(view, width, stable_rows, theme)
+    scale, layout = board_layout(width, height, theme, view.board_size)
+    log_box: Optional[Tuple[int, int]] = None
+    if layout == "wide":
+        top, log_box = _wide_top(view, width, height, scale, theme)
     else:
-        top = _narrow_top(view, width, stable_rows, room, theme)
+        top = _narrow_top(view, width, room, scale, theme)
     top = top[max(0, len(top) - room):] if room > 0 else []
     spare = room - len(top)
     separator = 1 if spare >= 2 else 0
-    log = _log_lines(view, width, spare - separator, theme)
+    log: List[str] = []
+    if log_box is None:
+        log_box = (width, max(0, spare - separator))
+        log = _log_lines(view, width, spare - separator, theme)
     filler = [""] * (spare - len(log))
     lines = [truncate(line, width) for line in top + filler + log + footer + [prompt]]
-    return "\n".join(lines), (len(lines) - 1, caret_col)
+    return lines, (len(lines) - 1, caret_col), log_box

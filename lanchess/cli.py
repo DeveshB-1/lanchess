@@ -14,9 +14,19 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from . import __version__, config, game, net, term, ui
 from .engine import STARTING_FEN, Board, color_name
 
-_ADDRESS_IN_USE = {errno.EADDRINUSE, 10048}
-_ACCESS_DENIED = {errno.EACCES, 10013}
-_UNREACHABLE = {errno.ENETUNREACH, errno.EHOSTUNREACH, getattr(errno, "EHOSTDOWN", -1), 10051, 10065}
+
+def _codes(*names: str, windows: Sequence[int] = ()) -> frozenset:
+    """The values of the errno ``names`` that this platform defines, plus the Windows socket error
+    numbers: a socket error on Windows carries its WSAE* number (as errno and as winerror)."""
+    return frozenset([getattr(errno, name) for name in names if hasattr(errno, name)] + list(windows))
+
+
+_ADDRESS_IN_USE = _codes("EADDRINUSE", windows=(10048,))              # WSAEADDRINUSE
+_ACCESS_DENIED = _codes("EACCES", "EPERM", windows=(10013,))          # WSAEACCES
+_UNREACHABLE = _codes("ENETUNREACH", "EHOSTUNREACH", "EHOSTDOWN", "ENETDOWN",
+                      windows=(10051, 10065, 10064, 10050))           # WSAENETUNREACH, WSAEHOSTUNREACH, ...
+_TIMED_OUT = _codes("ETIMEDOUT", windows=(10060,))                    # WSAETIMEDOUT
+
 _ASCII_TABLE = str.maketrans({"—": "-", "…": "...", "·": "|"})
 
 EXAMPLES = """\
@@ -266,6 +276,12 @@ _OTHER_PORT = {  # how to host on another port: with --port, on the menu's Host 
 }
 
 
+def _error_is(exc: OSError, codes: frozenset) -> bool:
+    """Whether ``exc`` is one of ``codes``, by its errno or (on Windows) its winerror."""
+    return any(code in codes for code in (getattr(exc, "errno", None), getattr(exc, "winerror", None))
+               if isinstance(code, int))
+
+
 def server_error(exc: OSError, port: int, advice: str = "flag") -> Tuple[str, List[str]]:
     """The message and hints for a port that cannot be listened on.
 
@@ -274,10 +290,10 @@ def server_error(exc: OSError, port: int, advice: str = "flag") -> Tuple[str, Li
     """
     in_use, try_port = _OTHER_PORT.get(advice, _OTHER_PORT["flag"])
     other = 6000 if port != 6000 else 6001
-    if exc.errno in _ADDRESS_IN_USE:
+    if _error_is(exc, _ADDRESS_IN_USE):
         return (f"port {port} is already in use (another LAN Chess game or another program is using it).",
                 [in_use.format(port=other)])
-    if exc.errno in _ACCESS_DENIED:
+    if isinstance(exc, PermissionError) or _error_is(exc, _ACCESS_DENIED):
         if port < 1024:
             reason, example = "Ports below 1024 need administrator rights", net.DEFAULT_PORT
         else:  # e.g. a port Windows reserves, or a security policy
@@ -295,10 +311,10 @@ def connect_error(exc: OSError, host: str, port: int) -> Tuple[str, List[str]]:
         return (f"connection refused by {target}.",
                 ["Nobody is hosting a game there. Start hosting on the other computer first "
                  "(Host a game in the menu, or the 'host' command), and check the IP address and port."])
-    if isinstance(exc, socket.timeout):
+    if isinstance(exc, socket.timeout) or _error_is(exc, _TIMED_OUT):
         return (f"timed out connecting to {target}.",
                 [firewall_hint(port), "Also check that both computers are on the same network."])
-    if exc.errno in _UNREACHABLE:
+    if _error_is(exc, _UNREACHABLE):
         return (f"{target} is unreachable.",
                 ["Check that both computers are on the same network (and not on a guest Wi-Fi).",
                  firewall_hint(port)])
@@ -403,7 +419,8 @@ def run_host(args: argparse.Namespace, options: Options, settings: Optional[conf
     _say(theme, f"{opponent} joined from {conn.peer}. You play {color_name(host_color)}. Starting the game…")
     session = game.GameSession(mode="network", my_color=host_color, my_name=name, opponent_name=opponent,
                                conn=conn, time_control=args.time, fen=fen, pgn_dir=options.pgn_dir,
-                               autosave=not options.no_save, unicode=theme.unicode)
+                               autosave=not options.no_save, unicode=theme.unicode,
+                               board_size=_board_size(settings))
     return _play(session, conn, theme, plain, input_source)
 
 
@@ -567,7 +584,8 @@ def run_join(args: argparse.Namespace, options: Options, settings: Optional[conf
     _say(theme, f"Joined {opponent}'s game. You play {color_name(my_color)}{timing}. Starting…")
     session = game.GameSession(mode="network", my_color=my_color, my_name=name, opponent_name=opponent,
                                conn=conn, time_control=time_control, fen=joined.fen, pgn_dir=options.pgn_dir,
-                               autosave=not options.no_save, unicode=theme.unicode)
+                               autosave=not options.no_save, unicode=theme.unicode,
+                               board_size=_board_size(settings))
     return _play(session, conn, theme, plain, input_source)
 
 
@@ -580,8 +598,14 @@ def run_local(args: argparse.Namespace, options: Options, settings: Optional[con
     theme, plain = _setup_display(options)
     session = game.GameSession(mode="local", my_color=None, my_name="White", opponent_name="Black",
                                time_control=args.time, fen=args.fen or STARTING_FEN, pgn_dir=options.pgn_dir,
-                               autosave=not options.no_save, flip=not args.no_flip, unicode=theme.unicode)
+                               autosave=not options.no_save, flip=not args.no_flip, unicode=theme.unicode,
+                               board_size=_board_size(settings))
     return _play(session, None, theme, plain, input_source)
+
+
+def _board_size(settings: Optional[config.Settings]) -> str:
+    """The saved board size (auto when there are no saved settings)."""
+    return settings.board_size if settings is not None else "auto"
 
 
 _RUNNERS: Dict[str, Callable[..., int]] = {

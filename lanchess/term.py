@@ -49,6 +49,7 @@ CTRL_U = "CTRL_U"
 CTRL_W = "CTRL_W"
 CTRL_A = "CTRL_A"
 CTRL_E = "CTRL_E"
+CTRL_Z = "CTRL_Z"
 ALT_PREFIX = "ALT+"  # ALT+x: ESC followed by x (only reported when a parser is made with alt_keys=True)
 
 CONTROL_KEYS: Dict[str, str] = {
@@ -67,6 +68,7 @@ CONTROL_KEYS: Dict[str, str] = {
     "\x10": UP,
     "\x15": CTRL_U,
     "\x17": CTRL_W,
+    "\x1a": CTRL_Z,
     "\x7f": BACKSPACE,
 }
 
@@ -504,6 +506,8 @@ class LineEditor:
             return ("interrupt",)
         if key == CTRL_L:
             return ("redraw",)
+        if key == CTRL_Z:
+            return ("undo",)
         if key == PGUP:
             return ("scroll", -1)
         if key == PGDN:

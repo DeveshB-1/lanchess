@@ -11,7 +11,7 @@
 # source tarball instead, for the .pkg.tar.zst release file.
 
 pkgname=lanchess
-pkgver=1.0.0
+pkgver=1.0.1
 pkgrel=1
 pkgdesc='Terminal chess for two players on the same network'
 arch=('any')

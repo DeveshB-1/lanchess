@@ -171,7 +171,7 @@ class RecentHostTests(TempDirTestCase):
 
     def test_remember_host_failure_is_silent(self) -> None:
         blocker = os.path.join(self.dir, "a-file")
-        with open(blocker, "w") as handle:
+        with open(blocker, "w", encoding="utf-8") as handle:
             handle.write("x")
         self.assertFalse(config.remember_host("10.0.0.1", 5555, os.path.join(blocker, "config.json")))
 
